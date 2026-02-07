@@ -1,0 +1,77 @@
+# -----------------------------
+# Project-private / local-only
+# -----------------------------
+Instructions.md
+PROJECT_GAME_PLAN.md
+config/paths.env
+
+# -----------------------------
+# Generated outputs and logs
+# -----------------------------
+logs/
+results/
+
+# Explicit sample-specific artifacts (for clarity)
+results/vep/DEMO_SAMPLE_001*
+results/monogenic/high_confidence_clinvar*
+results/monogenic/priority_variants*
+results/monogenic/lof_protein_altering.tsv
+results/monogenic/clinvar_plp_protein_altering.tsv
+
+# -----------------------------
+# Bioinformatics large artifacts
+# -----------------------------
+*.vcf
+*.vcf.gz
+*.vcf.gz.tbi
+*.bcf
+*.bcf.csi
+*.cram
+*.cram.crai
+*.bam
+*.bai
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.fa
+*.fasta
+*.fa.gz
+*.fasta.gz
+*.fai
+*.dict
+*.gff
+*.gff3
+*.gtf
+*.bed
+*.bed.gz
+*.bgz
+*.bgzip
+*.parquet
+
+# PLINK
+*.pgen
+*.pvar
+*.psam
+*.bed
+*.bim
+*.fam
+*.log
+*.nosex
+
+# -----------------------------
+# Python / editor
+# -----------------------------
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.python-version
+
+.idea/
+.vscode/
+*.tmp
+*.swp
