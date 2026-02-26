@@ -1,2 +1,2 @@
 sampleset,path_prefix,chrom,format,vcf_genotype_field
-SGIHZBQI9ZH,/mnt/c/Users/<YOUR_USER>/Salud/WGS/<SAMPLE>.hard-filtered,,vcf,GT
+DEMO_SAMPLE_001,/path/to/DEMO_SAMPLE_001.hard-filtered,,vcf,GT

@@ -1,5 +1,5 @@
-# One PGS ID per line (replace with your selected traits)
-# Example IDs below are placeholders and may be updated over time in the catalog.
-PGS001229
-PGS001849
-PGS003725
+# One PGS ID per line.
+# Example IDs are placeholders; update to your selected scores.
+PGS000001
+PGS000002
+PGS000003
