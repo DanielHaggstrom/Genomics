@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Python syntax checks
+        run: python -m py_compile workflow/monogenic/*.py workflow/utils/*.py
+
+      - name: Shell checks
+        run: |
+          shellcheck workflow/prs/*.sh workflow/run_pipeline.sh workflow/utils/prepublish_check.sh
+          bash -n workflow/prs/*.sh workflow/run_pipeline.sh workflow/utils/prepublish_check.sh
+
+      - name: Pipeline help
+        run: bash workflow/run_pipeline.sh --help
+
+      - name: Prepublish safety check
+        run: bash workflow/utils/prepublish_check.sh
