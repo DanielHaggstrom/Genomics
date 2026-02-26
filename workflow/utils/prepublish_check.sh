@@ -8,7 +8,7 @@ PATTERN='(AKIA[0-9A-Z]{16}|BEGIN (RSA|EC|OPENSSH|PGP) PRIVATE KEY|api[_-]?key\s*
 TRACKED_FILES=()
 while IFS= read -r f; do
   case "$f" in
-    *.example*|.env.example)
+    *.example*|.env.example|workflow/utils/prepublish_check.sh)
       continue
       ;;
     *)
