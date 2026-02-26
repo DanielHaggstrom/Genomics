@@ -5,48 +5,45 @@
 Run reproducible personal-genomics analysis on immutable WGS inputs:
 
 1. Monogenic triage from ClinVar-enriched VEP annotations.
-2. Polygenic scoring (PRS) from selected PGS IDs against the same sample.
+2. Polygenic scoring (PRS) from selected PGS IDs.
 
 ## Data Model
 
 1. Inputs (immutable, outside repo):
-   - `*.vcf.gz`, `*.tbi`, `*.cram`, `*.crai` in `C:/Users/<YOUR_USER>/Salud/WGS`.
-2. Config (local + versioned templates):
-   - `config/paths.env` (private)
-   - `config/prs_samplesheet.csv` (private)
-   - `config/prs_pgs_ids.txt` (private)
-   - `config/prs_update_sex.tsv` (private; strict 3-column format)
+   - `*.vcf.gz`, `*.tbi`, `*.cram`, `*.crai` under your local WGS data directory.
+2. Config:
+   - Tracked templates: `config/*.example*`, `.env.example`
+   - Local/private copies: `.env`, `config/pipeline.env`, `config/secrets.env`, `config/paths.env`, PRS local config files
 3. Derived outputs:
-   - `results/vep/*`
-   - `results/monogenic/*`
-   - `results/prs/*` (when PRS succeeds)
-4. Audit logs:
-   - `logs/input_checksums_pre.txt`
-   - `logs/input_checksums_post.txt`
-   - `logs/input_checksums_recheck_2026-02-08.txt`
+   - `results/monogenic/<SAMPLE_ID>/`
+   - `results/prs/pgsc_calc/`
+4. Runtime artifacts:
+   - `work/`, `.nextflow/`, `.nextflow.log*`
+5. Operational logs:
+   - `logs/`
 
 ## Workflow Layers
 
-1. Annotation layer:
-   - Ensembl VEP (offline cache, GRCh38)
-   - Output: ClinVar-enriched annotated VCF
-2. Monogenic triage layer:
+1. Orchestration layer:
+   - `workflow/run_pipeline.sh`
+2. Monogenic layer:
+   - `workflow/monogenic/extract_priority_variants.py`
+   - `workflow/monogenic/build_monogenic_shortlists.py`
    - `workflow/monogenic/triage_clinvar_enriched.py`
    - `workflow/monogenic/dedup_shortlist_by_variant.py`
-3. PRS orchestration layer:
+3. PRS layer:
    - `workflow/prs/prepare_prs_samplesheet.sh`
    - `workflow/prs/run_pgsc_calc.sh`
    - Nextflow pipeline: `pgscatalog/pgsc_calc`
 
-## Runtime Strategy
+## Runtime Policy
 
-1. Container-first:
-   - `docker` -> `apptainer`/`singularity`
-2. `conda` fallback only.
-3. Long-running PRS execution in `tmux` (not shell job-control background loops).
+1. Container-first PRS execution: `docker`, then `apptainer`/`singularity`.
+2. `conda` fallback only when containers are unavailable.
+3. Long runs in `tmux`.
 
-## Operational Boundaries
+## Publish-Safe Policy
 
-1. This repo never edits source genomic files.
-2. Cleanup targets only transient runtime artifacts (`work/`, `.nextflow/`, failed run snapshots).
-3. Reference build for this project is GRCh38 end-to-end.
+1. Never commit local/private env files.
+2. Commit only example templates with fake values.
+3. Never commit genomic source data or generated run outputs.

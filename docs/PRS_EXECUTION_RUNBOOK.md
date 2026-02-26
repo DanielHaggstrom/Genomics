@@ -1,14 +1,12 @@
 # PRS Execution Runbook (WSL)
 
-This runbook reflects issues seen in this project and the corrected strategy.
-
 ## Runtime policy
 
 1. Preferred: container runtime (`docker`, then `apptainer`/`singularity`).
 2. Fallback: `conda` only when containers are unavailable.
 3. Never run `wsl` from inside WSL.
 
-`workflow/prs/run_pgsc_calc.sh` now auto-selects runtime by default.
+`workflow/prs/run_pgsc_calc.sh` auto-selects runtime by default.
 
 ## Open the correct shell
 
@@ -21,7 +19,7 @@ wsl -d Ubuntu
 Then in Ubuntu:
 
 ```bash
-cd /mnt/c/Users/<YOUR_USER>/Coding/Projects/Genomics
+cd /mnt/c/path/to/Genomics
 ```
 
 ## One-time checks
@@ -34,11 +32,11 @@ which singularity || true
 which conda || true
 ```
 
-## Run reliably (tmux, not backgrounded nohup)
+## Run reliably (tmux)
 
 ```bash
 tmux new -s prs
-cd /mnt/c/Users/<YOUR_USER>/Coding/Projects/Genomics
+cd /mnt/c/path/to/Genomics
 bash workflow/prs/run_pgsc_calc.sh
 ```
 
@@ -57,22 +55,17 @@ tmux attach -t prs
 ## Monitor in a second shell
 
 ```bash
-cd /mnt/c/Users/<YOUR_USER>/Coding/Projects/Genomics
+cd /mnt/c/path/to/Genomics
 tail -f .nextflow.log
-```
-
-Quick status:
-
-```bash
 nextflow log
 ```
 
 ## If interrupted
 
-The script already uses `-resume`. Re-run same command:
+The script supports resume; rerun the same command:
 
 ```bash
-cd /mnt/c/Users/<YOUR_USER>/Coding/Projects/Genomics
+cd /mnt/c/path/to/Genomics
 bash workflow/prs/run_pgsc_calc.sh
 ```
 
@@ -84,17 +77,17 @@ bash workflow/prs/run_pgsc_calc.sh
 
 2. Session lock error (`Unable to acquire lock on session...`)
    - Cause: stale/stopped Nextflow process.
-   - Fix: stop old process, then rerun with `-resume`.
+   - Fix: stop old process, then rerun with resume.
 
 3. `Process requirement exceeds available memory`
-   - Fix: lower memory, e.g.:
+   - Fix: lower memory, for example:
    - `PGSC_MAX_MEMORY=12.GB bash workflow/prs/run_pgsc_calc.sh`
 
 4. `chrX` sex / PAR errors
-   - Fixes already applied in script:
+   - Built-in script options:
    - `--split-par b38`
-   - optional `config/prs_update_sex.tsv` in strict format: `FID IID SEX` (no comments/blank lines)
+   - Optional `config/prs_update_sex.tsv` with strict `FID IID SEX` format.
 
-5. Conda solve mismatch for pgsc_calc v2.2.0
-   - Only if running `-profile conda`:
-   - patch cached env pin `pgscatalog.calc=0.3.1` as noted by script output.
+5. Conda solve mismatch for `pgsc_calc v2.2.0`
+   - Affects only `-profile conda`.
+   - Follow script guidance to patch cached env pin if needed.
