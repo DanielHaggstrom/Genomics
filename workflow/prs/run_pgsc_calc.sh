@@ -18,7 +18,21 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-SAMPLESHEET="config/prs_samplesheet.csv"
+if [[ -f ".env" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source ".env"
+  set +a
+fi
+
+if [[ -f "config/secrets.env" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "config/secrets.env"
+  set +a
+fi
+
+SAMPLESHEET="${PGSC_SAMPLESHEET:-config/prs_samplesheet.csv}"
 DEFAULT_PGS_IDS_FILE="config/prs_pgs_ids.txt"
 PGS_IDS_FILE="${PGSC_PGS_IDS_FILE:-$DEFAULT_PGS_IDS_FILE}"
 SEX_UPDATE_FILE="config/prs_update_sex.tsv"
