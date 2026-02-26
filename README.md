@@ -1,170 +1,96 @@
 # Genomics WGS Risk Analysis Pipeline
 
-Local, privacy-preserving workflow for personal whole-genome sequencing (WGS) analysis.
+Structured, reproducible local pipeline for personal WGS analysis with two stages:
+- Monogenic triage from ClinVar-enriched VEP output.
+- Polygenic risk scoring (PRS) via `pgscatalog/pgsc_calc`.
 
-Primary objective:
-- monogenic variant triage with ClinVar evidence and transcript-aware filtering.
+This repository is publish-safe by default:
+- Real secrets and local machine paths are ignored by git.
+- Example config files with fake values are tracked.
 
-Planned next objective:
-- polygenic risk score (PRS) computation using PGS Catalog tooling.
+## Project Layout
 
-## Strategy Update
+- `workflow/run_pipeline.sh`: single entrypoint orchestrating stages.
+- `workflow/monogenic/`: monogenic analysis scripts.
+- `workflow/prs/`: PRS prep and execution scripts.
+- `workflow/utils/`: utility helpers.
+- `config/*.example*`: tracked templates.
+- `docs/`: architecture and runbooks.
+- `results/`, `logs/`, `work/`, `.nextflow/`: generated artifacts (ignored).
 
-This project now uses a strict runtime policy for PRS:
+## Quick Start
 
-1. Prefer containerized execution (`docker`, then `apptainer`/`singularity`).
-2. Use `conda` only as fallback when containers are unavailable.
-3. Run long jobs in `tmux` (not fragile shell job control / ad-hoc `nohup`).
-
-See `docs/PRS_EXECUTION_RUNBOOK.md` for the operational playbook.
-See `docs/ARCHITECTURE.md` for the high-level system view.
-See `docs/TARGETED_GENOTYPING_PLAN.md` for the CRAM -> PRS-targeted VCF strategy.
-
-## Data Safety Policy
-
-1. Source data in the WGS folder is treated as immutable input.
-2. Original `*.vcf.gz`, `*.tbi`, `*.cram`, `*.crai` must never be modified.
-3. Derived outputs are written only under `results/` and logs under `logs/`.
-4. Pre/post SHA256 manifests are retained to verify input integrity.
-
-## Repository Layout
-
-- `config/`
-- `config/paths.env.example`: template for local paths.
-- `config/paths.env`: local/private paths (gitignored).
-- `workflow/monogenic/`
-- Core monogenic pipeline scripts.
-- `workflow/utils/`
-- Auxiliary utility scripts.
-- `results/vep/`
-- ClinVar-enriched VEP output(s).
-- `results/monogenic/`
-- Current triage outputs.
-- `logs/`
-- Checksum manifests and active run logs.
-
-## Current Retained Outputs
-
-- `results/vep/SGIHZBQI9ZH.vep.clinvar_enriched.vcf.gz`
-- `results/vep/SGIHZBQI9ZH.vep.clinvar_enriched.vcf.gz_summary.html`
-- `results/monogenic/high_confidence_clinvar_summary.md`
-- `results/monogenic/high_confidence_clinvar_shortlist.tsv`
-- `results/monogenic/high_confidence_clinvar_unique_variants.tsv`
-
-First-pass non-enriched VEP output and redundant intermediate monogenic tables were removed during cleanup.
-
-## Monogenic Workflow
-
-1. Extract broad priority annotations from VEP output:
+1. Bootstrap local config files:
 
 ```bash
-python3 workflow/monogenic/extract_priority_variants.py \
-  --input-vcf results/vep/<sample>.vep.clinvar_enriched.vcf.gz \
-  --output-tsv results/monogenic/priority_variants.tsv \
-  --summary-txt results/monogenic/priority_variants.summary.txt
+make bootstrap
 ```
 
-2. Build broad monogenic shortlists:
+2. Edit local files (ignored by git):
+- `config/pipeline.env`
+- `config/secrets.env`
+- `.env`
+- `config/prs_samplesheet.csv` (or set auto-build)
+- `config/prs_pgs_ids.txt`
+
+3. Run validation checks:
 
 ```bash
-python3 workflow/monogenic/build_monogenic_shortlists.py \
-  --input-tsv results/monogenic/priority_variants.tsv \
-  --outdir results/monogenic
+make validate
+make prepublish
 ```
 
-3. Build high-confidence ClinVar shortlist:
+4. Run pipeline:
 
 ```bash
-python3 workflow/monogenic/triage_clinvar_enriched.py \
-  --input-vcf results/vep/<sample>.vep.clinvar_enriched.vcf.gz \
-  --output-tsv results/monogenic/high_confidence_clinvar_shortlist.tsv \
-  --summary-md results/monogenic/high_confidence_clinvar_summary.md \
-  --max-af 0.01
+# full pipeline
+make pipeline
+
+# monogenic only
+make monogenic
+
+# PRS only
+make prs
 ```
 
-4. Collapse to unique variants (canonical-preferred):
+## Pipeline Configuration
 
-```bash
-python3 workflow/monogenic/dedup_shortlist_by_variant.py \
-  --input-tsv results/monogenic/high_confidence_clinvar_shortlist.tsv \
-  --output-tsv results/monogenic/high_confidence_clinvar_unique_variants.tsv
-```
+Primary runtime config: `config/pipeline.env`
 
-## Environment
+Key variables:
+- `SAMPLE_ID`: logical sample identifier for outputs.
+- `ANNOTATED_VCF_GZ`: path to ClinVar-enriched VEP VCF (`.vcf.gz`).
+- `RUN_MONOGENIC` / `RUN_PRS`: enable stages in `--stage all` mode.
+- `MONOGENIC_MODE`, `MONOGENIC_MAX_AF`: triage strictness.
+- `PRS_AUTOBUILD_SAMPLESHEET`: set `1` to build from `config/paths.env`.
+- `PRS_SAMPLESHEET`, `PRS_PGS_IDS_FILE`: PRS inputs.
+- `PGSC_PROFILE`, `PGSC_MAX_MEMORY`, `PGSC_MIN_OVERLAP`, `PGSC_RESUME`: pgsc_calc runtime controls.
 
-Recommended runtime:
-- Windows 10/11 + WSL2 (Ubuntu)
-- `python3`, `vep`, `bcftools`, `plink2`
+Optional secret files:
+- `.env` (from `.env.example`)
+- `config/secrets.env` (from `config/secrets.env.example`)
 
-## PRS Stage (Next)
+Both are auto-loaded if present.
 
-This repo now includes a starter PRS workflow for `pgsc_calc`:
+## Security and Publishing
 
-- `config/prs_samplesheet.example.csv`
-- `config/prs_pgs_ids.example.txt`
-- `workflow/prs/prepare_prs_samplesheet.sh`
-- `workflow/prs/run_pgsc_calc.sh`
+Ignored by default:
+- Real env/secrets files (`.env`, `config/secrets.env`, `config/pipeline.env`, etc.)
+- Local path configs (`config/paths.env`, `config/prs_*.csv|txt|tsv` local variants)
+- Runtime/cache/output artifacts
 
-### 1) Prepare config files
+Before publishing:
+1. Confirm `git status` does not include private/local files.
+2. Keep only `*.example*` templates for configuration.
+3. Do not commit generated `results/` or `logs/`.
 
-```bash
-cp config/prs_samplesheet.example.csv config/prs_samplesheet.csv
-cp config/prs_pgs_ids.example.txt config/prs_pgs_ids.txt
-```
+## CI
 
-Or auto-build the samplesheet from `config/paths.env`:
-
-```bash
-bash workflow/prs/prepare_prs_samplesheet.sh
-```
-
-Note:
-- `prepare_prs_samplesheet.sh` now sanitizes `sampleset` to safe IDs (`A-Z`, `a-z`, `0-9`, `_`, `-`).
-
-### 2) Run pgsc_calc
-
-```bash
-bash workflow/prs/run_pgsc_calc.sh
-```
-
-Run with a specific ID file (for batching):
-
-```bash
-bash workflow/prs/run_pgsc_calc.sh config/prs_batches/pgs_ids_batch_01.txt
-```
-
-Notes:
-- Runtime profile is auto-selected by the script in this order:
-  - `docker` -> `apptainer` -> `singularity` -> `conda`
-- You can force a profile:
-  - `PGSC_PROFILE=docker bash workflow/prs/run_pgsc_calc.sh`
-  - `PGSC_PROFILE=conda bash workflow/prs/run_pgsc_calc.sh`
-- You can adjust memory:
-  - `PGSC_MAX_MEMORY=12.GB bash workflow/prs/run_pgsc_calc.sh`
-- You can lower the match threshold (default `0.75`) when many scores fail matching:
-  - `PGSC_MIN_OVERLAP=0.50 bash workflow/prs/run_pgsc_calc.sh config/prs_batches/pgs_ids_batch_01.txt`
-- You can disable Nextflow cache reuse for a clean rerun:
-  - `PGSC_RESUME=0 bash workflow/prs/run_pgsc_calc.sh config/prs_batches/pgs_ids_batch_01.txt`
-- If using `config/prs_update_sex.tsv`, file must be strict `FID IID SEX` (no comments/blank lines).
-
-Optional batching helper:
-
-```bash
-bash workflow/prs/split_pgs_ids.sh
-```
-
-Defaults:
-- input: `config/prs_pgs_ids.txt`
-- batch size: `10`
-- output dir: `config/prs_batches/`
-
-Outputs are written to:
-- `results/prs/pgsc_calc/`
-
-Note:
-- `pgsc_calc` support and expectations for WGS/VCF inputs can evolve by version.
-- Use `docs/PRS_EXECUTION_RUNBOOK.md` for failure recovery (`-resume`, lock cleanup flow, chrX handling context).
+GitHub Actions workflow at `.github/workflows/ci.yml` runs:
+- Python syntax checks
+- Shell lint and syntax checks
+- Pipeline help/entrypoint check
 
 ## Disclaimer
 
-This repository supports research/hobby analysis only and is not a medical diagnostic system.
+This project is for research/hobby analysis and is not a medical diagnostic system.
