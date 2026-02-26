@@ -3,6 +3,12 @@
 # -----------------------------
 Instructions.md
 PROJECT_GAME_PLAN.md
+.env
+.env.local
+.env.*
+!.env.example
+config/pipeline.env
+config/secrets.env
 config/paths.env
 config/prs_samplesheet.csv
 config/prs_pgs_ids.txt
