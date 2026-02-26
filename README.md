@@ -8,6 +8,18 @@ Primary objective:
 Planned next objective:
 - polygenic risk score (PRS) computation using PGS Catalog tooling.
 
+## Strategy Update
+
+This project now uses a strict runtime policy for PRS:
+
+1. Prefer containerized execution (`docker`, then `apptainer`/`singularity`).
+2. Use `conda` only as fallback when containers are unavailable.
+3. Run long jobs in `tmux` (not fragile shell job control / ad-hoc `nohup`).
+
+See `docs/PRS_EXECUTION_RUNBOOK.md` for the operational playbook.
+See `docs/ARCHITECTURE.md` for the high-level system view.
+See `docs/TARGETED_GENOTYPING_PLAN.md` for the CRAM -> PRS-targeted VCF strategy.
+
 ## Data Safety Policy
 
 1. Source data in the WGS folder is treated as immutable input.
@@ -84,12 +96,74 @@ Recommended runtime:
 - Windows 10/11 + WSL2 (Ubuntu)
 - `python3`, `vep`, `bcftools`, `plink2`
 
-## Next Planned Step
+## PRS Stage (Next)
 
-Initialize PRS stage:
-- target genotype conversion with `plink2`
-- `pgsc_calc` setup
-- first trait batch: CAD, T2D, BMI, Alzheimer’s, lipids
+This repo now includes a starter PRS workflow for `pgsc_calc`:
+
+- `config/prs_samplesheet.example.csv`
+- `config/prs_pgs_ids.example.txt`
+- `workflow/prs/prepare_prs_samplesheet.sh`
+- `workflow/prs/run_pgsc_calc.sh`
+
+### 1) Prepare config files
+
+```bash
+cp config/prs_samplesheet.example.csv config/prs_samplesheet.csv
+cp config/prs_pgs_ids.example.txt config/prs_pgs_ids.txt
+```
+
+Or auto-build the samplesheet from `config/paths.env`:
+
+```bash
+bash workflow/prs/prepare_prs_samplesheet.sh
+```
+
+Note:
+- `prepare_prs_samplesheet.sh` now sanitizes `sampleset` to safe IDs (`A-Z`, `a-z`, `0-9`, `_`, `-`).
+
+### 2) Run pgsc_calc
+
+```bash
+bash workflow/prs/run_pgsc_calc.sh
+```
+
+Run with a specific ID file (for batching):
+
+```bash
+bash workflow/prs/run_pgsc_calc.sh config/prs_batches/pgs_ids_batch_01.txt
+```
+
+Notes:
+- Runtime profile is auto-selected by the script in this order:
+  - `docker` -> `apptainer` -> `singularity` -> `conda`
+- You can force a profile:
+  - `PGSC_PROFILE=docker bash workflow/prs/run_pgsc_calc.sh`
+  - `PGSC_PROFILE=conda bash workflow/prs/run_pgsc_calc.sh`
+- You can adjust memory:
+  - `PGSC_MAX_MEMORY=12.GB bash workflow/prs/run_pgsc_calc.sh`
+- You can lower the match threshold (default `0.75`) when many scores fail matching:
+  - `PGSC_MIN_OVERLAP=0.50 bash workflow/prs/run_pgsc_calc.sh config/prs_batches/pgs_ids_batch_01.txt`
+- You can disable Nextflow cache reuse for a clean rerun:
+  - `PGSC_RESUME=0 bash workflow/prs/run_pgsc_calc.sh config/prs_batches/pgs_ids_batch_01.txt`
+- If using `config/prs_update_sex.tsv`, file must be strict `FID IID SEX` (no comments/blank lines).
+
+Optional batching helper:
+
+```bash
+bash workflow/prs/split_pgs_ids.sh
+```
+
+Defaults:
+- input: `config/prs_pgs_ids.txt`
+- batch size: `10`
+- output dir: `config/prs_batches/`
+
+Outputs are written to:
+- `results/prs/pgsc_calc/`
+
+Note:
+- `pgsc_calc` support and expectations for WGS/VCF inputs can evolve by version.
+- Use `docs/PRS_EXECUTION_RUNBOOK.md` for failure recovery (`-resume`, lock cleanup flow, chrX handling context).
 
 ## Disclaimer
 
