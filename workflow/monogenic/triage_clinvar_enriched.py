@@ -24,6 +24,18 @@ HIGH_REVIEW_MARKERS = (
     "criteria_provided&_multiple_submitters&_no_conflicts",
 )
 
+SINGLE_REVIEW_MARKER = "criteria_provided&_single_submitter"
+
+LOF_TERMS = {
+    "stop_gained",
+    "stop_lost",
+    "frameshift_variant",
+    "splice_acceptor_variant",
+    "splice_donor_variant",
+    "start_lost",
+    "transcript_ablation",
+}
+
 
 def info_map(info: str) -> dict:
     out = {}
@@ -57,6 +69,25 @@ def high_review(rev: str) -> bool:
     return any((m in r) or (m in r_norm) for m in HIGH_REVIEW_MARKERS)
 
 
+def single_submitter_review(rev: str) -> bool:
+    return SINGLE_REVIEW_MARKER in rev.lower()
+
+
+def review_tier(rev: str) -> str:
+    if not rev:
+        return "none"
+    if high_review(rev):
+        return "high"
+    if single_submitter_review(rev):
+        return "single_submitter"
+    return "other"
+
+
+def has_lof(consequence: str) -> bool:
+    vals = {x.strip() for x in consequence.split("&") if x.strip()}
+    return any(x in vals for x in LOF_TERMS)
+
+
 def parse_float(s: str) -> float | None:
     try:
         return float(s)
@@ -69,8 +100,17 @@ def main() -> None:
     p.add_argument("--input-vcf", required=True)
     p.add_argument("--output-tsv", required=True)
     p.add_argument("--summary-md", required=True)
-    p.add_argument("--max-af", type=float, default=0.01)
+    p.add_argument("--mode", choices=["strict", "moderate", "broad"], default="moderate")
+    p.add_argument("--max-af", type=float, default=None)
     args = p.parse_args()
+
+    if args.max_af is None:
+        if args.mode == "strict":
+            args.max_af = 0.01
+        elif args.mode == "moderate":
+            args.max_af = 0.05
+        else:
+            args.max_af = 0.10
 
     os.makedirs(os.path.dirname(args.output_tsv), exist_ok=True)
     os.makedirs(os.path.dirname(args.summary_md), exist_ok=True)
@@ -80,6 +120,8 @@ def main() -> None:
 
     n_total = 0
     c_pass = c_protein = c_plp = c_review = c_noconf = c_rare = 0
+    c_selected = 0
+    selected_by_reason = Counter()
 
     with gzip.open(args.input_vcf, "rt", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -122,19 +164,63 @@ def main() -> None:
                     continue
                 c_plp += 1
 
-                if not high_review(clnrev):
-                    continue
-                c_review += 1
+                rev_tier = review_tier(clnrev)
+                if rev_tier == "high":
+                    c_review += 1
 
-                if has_conflict(clnsig, clnrev):
-                    continue
-                c_noconf += 1
+                conflict = has_conflict(clnsig, clnrev)
+                if not conflict:
+                    c_noconf += 1
 
+                consequence = m.get("Consequence", "")
+                impact = m.get("IMPACT", "")
+                canonical = m.get("CANONICAL", "")
                 max_af_str = m.get("MAX_AF", "")
                 max_af = parse_float(max_af_str)
-                if max_af is None or max_af > args.max_af:
+                if max_af is not None and max_af <= args.max_af:
+                    c_rare += 1
+
+                # Selection logic by mode (all modes keep: PASS, protein-altering, ClinVar P/LP, non-conflicting)
+                select = False
+                reason = ""
+                if args.mode == "strict":
+                    if (not conflict) and rev_tier == "high" and max_af is not None and max_af <= args.max_af:
+                        select = True
+                        reason = "high_review_and_rare"
+                elif args.mode == "moderate":
+                    # Less restrictive but still selective:
+                    # keep rare P/LP protein-altering variants, retain conflict flag for downstream review.
+                    if max_af is not None and max_af <= args.max_af and (rev_tier != "none" or impact == "HIGH" or has_lof(consequence)):
+                        select = True
+                        if conflict:
+                            reason = "rare_plp_conflicting"
+                        elif rev_tier in {"high", "single_submitter"}:
+                            reason = "rare_plp_reviewed"
+                        else:
+                            reason = "rare_plp_other_review"
+                    elif max_af is None and (impact == "HIGH" or has_lof(consequence)) and rev_tier != "none":
+                        select = True
+                        if conflict:
+                            reason = "high_impact_conflicting_missing_af"
+                        else:
+                            reason = "high_impact_reviewed_missing_af"
+                else:
+                    # Broad but still selective: allow any non-conflicting review tier,
+                    # require either low-frequency evidence or severe consequence.
+                    if (not conflict) and max_af is not None and max_af <= args.max_af:
+                        select = True
+                        reason = "nonconflicting_plp_low_frequency"
+                    elif (not conflict) and max_af is None and (impact == "HIGH" or has_lof(consequence) or canonical == "YES"):
+                        select = True
+                        reason = "nonconflicting_plp_severe_missing_af"
+                    elif conflict and max_af is not None and max_af <= 0.01 and (impact == "HIGH" or has_lof(consequence)):
+                        select = True
+                        reason = "conflicting_but_rare_high_impact"
+
+                if not select:
                     continue
-                c_rare += 1
+                c_selected += 1
+                selected_by_reason[reason] += 1
 
                 rows.append(
                     {
@@ -149,8 +235,8 @@ def main() -> None:
                         "GENE_SYMBOL": m.get("SYMBOL", ""),
                         "GENE_ID": m.get("Gene", ""),
                         "CONSEQUENCE": consequence,
-                        "IMPACT": m.get("IMPACT", ""),
-                        "CANONICAL": m.get("CANONICAL", ""),
+                        "IMPACT": impact,
+                        "CANONICAL": canonical,
                         "HGVSc": m.get("HGVSc", ""),
                         "HGVSp": m.get("HGVSp", ""),
                         "EXISTING_VARIATION": m.get("Existing_variation", ""),
@@ -159,6 +245,10 @@ def main() -> None:
                         "CLINVAR_CLNDN": m.get("ClinVar_CLNDN", ""),
                         "MAX_AF": max_af_str,
                         "MAX_AF_POPS": m.get("MAX_AF_POPS", ""),
+                        "CLINVAR_CONFLICT_FLAG": "YES" if conflict else "NO",
+                        "REVIEW_TIER": rev_tier,
+                        "SELECTION_MODE": args.mode,
+                        "SELECTION_REASON": reason,
                     }
                 )
 
@@ -175,7 +265,9 @@ def main() -> None:
     header = list(dedup[0].keys()) if dedup else [
         "CHROM", "POS", "ID", "REF", "ALT", "GT", "DP", "GQ", "GENE_SYMBOL", "GENE_ID",
         "CONSEQUENCE", "IMPACT", "CANONICAL", "HGVSc", "HGVSp", "EXISTING_VARIATION",
-        "CLINVAR_CLNSIG", "CLINVAR_CLNREVSTAT", "CLINVAR_CLNDN", "MAX_AF", "MAX_AF_POPS"
+        "CLINVAR_CLNSIG", "CLINVAR_CLNREVSTAT", "CLINVAR_CLNDN", "MAX_AF", "MAX_AF_POPS",
+        "CLINVAR_CONFLICT_FLAG",
+        "REVIEW_TIER", "SELECTION_MODE", "SELECTION_REASON"
     ]
     with open(args.output_tsv, "w", encoding="utf-8") as out:
         out.write("\t".join(header) + "\n")
@@ -184,7 +276,9 @@ def main() -> None:
 
     top_genes = Counter((r["GENE_SYMBOL"] or r["GENE_ID"] or "UNKNOWN") for r in dedup).most_common(20)
     with open(args.summary_md, "w", encoding="utf-8") as out:
-        out.write("# High-Confidence ClinVar Triage\n\n")
+        out.write("# ClinVar Triage\n\n")
+        out.write(f"- Mode: {args.mode}\n")
+        out.write(f"- MAX_AF threshold: {args.max_af}\n")
         out.write(f"- Total variants in VCF: {n_total}\n")
         out.write(f"- PASS variants: {c_pass}\n")
         out.write(f"- Protein-altering annotations: {c_protein}\n")
@@ -192,7 +286,12 @@ def main() -> None:
         out.write(f"- High-review (2+ star equivalent) annotations: {c_review}\n")
         out.write(f"- Non-conflicting annotations: {c_noconf}\n")
         out.write(f"- Rare annotations (MAX_AF <= {args.max_af}): {c_rare}\n")
+        out.write(f"- Selected annotations before dedup: {c_selected}\n")
         out.write(f"- Final deduplicated shortlist rows: {len(dedup)}\n\n")
+        out.write("## Selection reasons\n")
+        for k, v in selected_by_reason.most_common():
+            out.write(f"- {k}: {v}\n")
+        out.write("\n")
         out.write("## Top genes\n")
         for gene, n in top_genes:
             out.write(f"- {gene}: {n}\n")
