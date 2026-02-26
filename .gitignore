@@ -4,6 +4,10 @@
 Instructions.md
 PROJECT_GAME_PLAN.md
 config/paths.env
+config/prs_samplesheet.csv
+config/prs_pgs_ids.txt
+config/prs_update_sex.tsv
+config/prs_batches/
 
 # -----------------------------
 # Generated outputs and logs
@@ -17,6 +21,17 @@ results/monogenic/high_confidence_clinvar*
 results/monogenic/priority_variants*
 results/monogenic/lof_protein_altering.tsv
 results/monogenic/clinvar_plp_protein_altering.tsv
+
+# -----------------------------
+# Nextflow runtime/cache
+# -----------------------------
+.nextflow/
+work/
+.nextflow.log*
+trace.txt
+timeline.html
+report.html
+dag.*
 
 # -----------------------------
 # Bioinformatics large artifacts
