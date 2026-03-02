@@ -94,3 +94,7 @@ GitHub Actions workflow at `.github/workflows/ci.yml` runs:
 ## Disclaimer
 
 This project is for research/hobby analysis and is not a medical diagnostic system.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
