@@ -14,6 +14,7 @@ This repository is publish-safe by default:
 - `workflow/monogenic/`: monogenic analysis scripts.
 - `workflow/prs/`: PRS prep and execution scripts.
 - `workflow/utils/`: utility helpers.
+- `workflow/utils/cleanup_runs.sh`: removes ignored generated runs/artifacts.
 - `config/*.example*`: tracked templates.
 - `docs/`: architecture and runbooks.
 - `results/`, `logs/`, `work/`, `.nextflow/`: generated artifacts (ignored).
@@ -38,6 +39,7 @@ make bootstrap
 ```bash
 make validate
 make prepublish
+make clean   # optional: remove old generated runs/artifacts
 ```
 
 4. Run pipeline:
@@ -58,7 +60,7 @@ make prs
 Primary runtime config: `config/pipeline.env`
 
 Key variables:
-- `SAMPLE_ID`: logical sample identifier for outputs.
+- `SAMPLE_ID`: logical sample identifier for monogenic outputs.
 - `ANNOTATED_VCF_GZ`: path to ClinVar-enriched VEP VCF (`.vcf.gz`).
 - `RUN_MONOGENIC` / `RUN_PRS`: enable stages in `--stage all` mode.
 - `MONOGENIC_MODE`, `MONOGENIC_MAX_AF`: triage strictness.

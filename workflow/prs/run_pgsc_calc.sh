@@ -155,13 +155,25 @@ fi
 
 mkdir -p "$OUTDIR"
 
-# Collapse PGS IDs into comma-separated list for the pipeline argument.
-# Strip CR characters to tolerate Windows-edited files.
+# Collapse PGS IDs into a comma-separated list for the pipeline argument.
+# Trim whitespace, ignore comments/blank lines, and strip CR characters to
+# tolerate Windows-edited files.
 PGS_IDS="$(
-  tr -d '\r' < "$PGS_IDS_FILE" \
-    | grep -v '^\s*#' \
-    | grep -v '^\s*$' \
-    | paste -sd, -
+  awk '
+    {
+      sub(/\r$/, "")
+    }
+    /^[[:space:]]*#/ {
+      next
+    }
+    /^[[:space:]]*$/ {
+      next
+    }
+    {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      print
+    }
+  ' "$PGS_IDS_FILE" | paste -sd, -
 )"
 
 if [[ -z "$PGS_IDS" ]]; then
@@ -190,7 +202,9 @@ if [[ -f "$SEX_UPDATE_FILE" ]]; then
     exit 1
   fi
 
-  PLINK2_EXTRA_ARGS="$PLINK2_EXTRA_ARGS --update-sex ${ROOT_DIR}/${SEX_UPDATE_FILE}"
+  sex_update_path="${ROOT_DIR}/${SEX_UPDATE_FILE}"
+  escaped_sex_update_path="$(printf "%s" "$sex_update_path" | sed "s/'/'\\\\''/g")"
+  PLINK2_EXTRA_ARGS="$PLINK2_EXTRA_ARGS --update-sex '$escaped_sex_update_path'"
   echo "Using sex update file: $SEX_UPDATE_FILE"
 fi
 cat > "$OVERRIDE_CONFIG" <<EOF

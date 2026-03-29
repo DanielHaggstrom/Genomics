@@ -24,8 +24,8 @@ jobs:
 
       - name: Shell checks
         run: |
-          shellcheck workflow/prs/*.sh workflow/run_pipeline.sh workflow/utils/prepublish_check.sh
-          bash -n workflow/prs/*.sh workflow/run_pipeline.sh workflow/utils/prepublish_check.sh
+          shellcheck workflow/prs/*.sh workflow/run_pipeline.sh workflow/utils/prepublish_check.sh workflow/utils/cleanup_runs.sh
+          bash -n workflow/prs/*.sh workflow/run_pipeline.sh workflow/utils/prepublish_check.sh workflow/utils/cleanup_runs.sh
 
       - name: Pipeline help
         run: bash workflow/run_pipeline.sh --help

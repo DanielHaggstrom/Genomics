@@ -1,12 +1,13 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: help bootstrap validate prepublish monogenic prs pipeline
+.PHONY: help bootstrap validate prepublish clean monogenic prs pipeline
 
 help:
 	@echo "Targets:"
 	@echo "  bootstrap  - create local config files from examples (if missing)"
 	@echo "  validate   - run syntax checks for Python and shell scripts"
 	@echo "  prepublish - scan tracked files for obvious secret/path leaks"
+	@echo "  clean      - delete generated pipeline runs/artifacts"
 	@echo "  monogenic  - run monogenic stage through workflow/run_pipeline.sh"
 	@echo "  prs        - run PRS stage through workflow/run_pipeline.sh"
 	@echo "  pipeline   - run full pipeline through workflow/run_pipeline.sh"
@@ -22,11 +23,14 @@ bootstrap:
 
 validate:
 	@python3 -m py_compile workflow/monogenic/*.py workflow/utils/*.py
-	@bash -n workflow/prs/*.sh workflow/run_pipeline.sh workflow/utils/prepublish_check.sh
+	@bash -n workflow/prs/*.sh workflow/run_pipeline.sh workflow/utils/prepublish_check.sh workflow/utils/cleanup_runs.sh
 	@echo "Validation checks passed."
 
 prepublish:
 	@bash workflow/utils/prepublish_check.sh
+
+clean:
+	@bash workflow/utils/cleanup_runs.sh
 
 monogenic:
 	@bash workflow/run_pipeline.sh --stage monogenic

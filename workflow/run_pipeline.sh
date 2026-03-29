@@ -22,6 +22,11 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --stage)
+      if [[ $# -lt 2 || "$2" == -* ]]; then
+        echo "--stage requires one of: all, monogenic, prs"
+        usage
+        exit 1
+      fi
       STAGE="${2:-}"
       shift 2
       ;;
@@ -76,12 +81,11 @@ PGSC_MAX_MEMORY="${PGSC_MAX_MEMORY:-14.GB}"
 PGSC_MIN_OVERLAP="${PGSC_MIN_OVERLAP:-0.75}"
 PGSC_RESUME="${PGSC_RESUME:-1}"
 
-if [[ -z "$SAMPLE_ID" ]]; then
-  echo "SAMPLE_ID is required in $PIPELINE_ENV"
-  exit 1
-fi
-
 run_monogenic() {
+  if [[ -z "$SAMPLE_ID" ]]; then
+    echo "SAMPLE_ID is required in $PIPELINE_ENV for monogenic outputs"
+    exit 1
+  fi
   if [[ -z "$ANNOTATED_VCF_GZ" ]]; then
     echo "ANNOTATED_VCF_GZ is required for monogenic stage"
     exit 1
