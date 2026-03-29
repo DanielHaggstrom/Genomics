@@ -6,6 +6,7 @@ cd "$ROOT_DIR"
 
 PIPELINE_ENV="config/pipeline.env"
 SECRETS_ENV="config/secrets.env"
+PATHS_ENV="config/paths.env"
 STAGE="all"
 
 usage() {
@@ -16,6 +17,7 @@ Environment files:
   - config/pipeline.env (required; copy from config/pipeline.env.example)
   - config/secrets.env (optional; copy from config/secrets.env.example)
   - .env (optional; copy from .env.example)
+  - config/paths.env (optional; used by PRS samplesheet auto-build and monogenic VEP auto-annotation)
 EOF
 }
 
@@ -67,12 +69,23 @@ set -a
 source "$PIPELINE_ENV"
 set +a
 
+if [[ -f "$PATHS_ENV" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$PATHS_ENV"
+  set +a
+fi
+
 SAMPLE_ID="${SAMPLE_ID:-}"
 ANNOTATED_VCF_GZ="${ANNOTATED_VCF_GZ:-}"
 RUN_MONOGENIC="${RUN_MONOGENIC:-1}"
 RUN_PRS="${RUN_PRS:-1}"
 MONOGENIC_MODE="${MONOGENIC_MODE:-moderate}"
 MONOGENIC_MAX_AF="${MONOGENIC_MAX_AF:-0.05}"
+MONOGENIC_AUTORUN_VEP="${MONOGENIC_AUTORUN_VEP:-0}"
+MONOGENIC_SOURCE_VCF_GZ="${MONOGENIC_SOURCE_VCF_GZ:-${VCF_GZ:-}}"
+MONOGENIC_VEP_DATA_DIR="${MONOGENIC_VEP_DATA_DIR:-}"
+MONOGENIC_VEP_FORKS="${MONOGENIC_VEP_FORKS:-8}"
 PRS_AUTOBUILD_SAMPLESHEET="${PRS_AUTOBUILD_SAMPLESHEET:-0}"
 PRS_SAMPLESHEET="${PRS_SAMPLESHEET:-config/prs_samplesheet.csv}"
 PRS_PGS_IDS_FILE="${PRS_PGS_IDS_FILE:-config/prs_pgs_ids.txt}"
@@ -86,12 +99,45 @@ run_monogenic() {
     echo "SAMPLE_ID is required in $PIPELINE_ENV for monogenic outputs"
     exit 1
   fi
-  if [[ -z "$ANNOTATED_VCF_GZ" ]]; then
+
+  local annotated_vcf="$ANNOTATED_VCF_GZ"
+  if [[ "$MONOGENIC_AUTORUN_VEP" == "1" ]]; then
+    if [[ -z "$MONOGENIC_SOURCE_VCF_GZ" ]]; then
+      echo "MONOGENIC_SOURCE_VCF_GZ is required when MONOGENIC_AUTORUN_VEP=1"
+      echo "Set it directly or provide VCF_GZ via $PATHS_ENV."
+      exit 1
+    fi
+    if [[ ! -f "$MONOGENIC_SOURCE_VCF_GZ" ]]; then
+      echo "Monogenic source VCF not found: $MONOGENIC_SOURCE_VCF_GZ"
+      exit 1
+    fi
+    if [[ -z "$annotated_vcf" ]]; then
+      local source_dir
+      source_dir="$(dirname "$MONOGENIC_SOURCE_VCF_GZ")"
+      local source_base
+      source_base="$(basename "$MONOGENIC_SOURCE_VCF_GZ" .vcf.gz)"
+      annotated_vcf="${source_dir}/vep_data/output/${source_base}.vep.clinvar_enriched.vcf.gz"
+    fi
+
+    local vep_args=(
+      --input-vcf "$MONOGENIC_SOURCE_VCF_GZ"
+      --output-vcf "$annotated_vcf"
+      --forks "$MONOGENIC_VEP_FORKS"
+    )
+    if [[ -n "$MONOGENIC_VEP_DATA_DIR" ]]; then
+      vep_args+=(--vep-data-dir "$MONOGENIC_VEP_DATA_DIR")
+    fi
+
+    bash workflow/monogenic/annotate_with_vep.sh "${vep_args[@]}"
+  fi
+
+  if [[ -z "$annotated_vcf" ]]; then
     echo "ANNOTATED_VCF_GZ is required for monogenic stage"
+    echo "Or set MONOGENIC_AUTORUN_VEP=1 with MONOGENIC_SOURCE_VCF_GZ."
     exit 1
   fi
-  if [[ ! -f "$ANNOTATED_VCF_GZ" ]]; then
-    echo "Monogenic input not found: $ANNOTATED_VCF_GZ"
+  if [[ ! -f "$annotated_vcf" ]]; then
+    echo "Monogenic input not found: $annotated_vcf"
     exit 1
   fi
 
@@ -99,7 +145,7 @@ run_monogenic() {
   mkdir -p "$outdir"
 
   python3 workflow/monogenic/extract_priority_variants.py \
-    --input-vcf "$ANNOTATED_VCF_GZ" \
+    --input-vcf "$annotated_vcf" \
     --output-tsv "$outdir/priority_variants.tsv" \
     --summary-txt "$outdir/priority_variants.summary.txt"
 
@@ -108,7 +154,7 @@ run_monogenic() {
     --outdir "$outdir"
 
   python3 workflow/monogenic/triage_clinvar_enriched.py \
-    --input-vcf "$ANNOTATED_VCF_GZ" \
+    --input-vcf "$annotated_vcf" \
     --output-tsv "$outdir/high_confidence_clinvar_shortlist.tsv" \
     --summary-md "$outdir/high_confidence_clinvar_summary.md" \
     --mode "$MONOGENIC_MODE" \

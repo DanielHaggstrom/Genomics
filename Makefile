@@ -23,7 +23,7 @@ bootstrap:
 
 validate:
 	@python3 -m py_compile workflow/monogenic/*.py workflow/utils/*.py
-	@bash -n workflow/prs/*.sh workflow/run_pipeline.sh workflow/utils/prepublish_check.sh workflow/utils/cleanup_runs.sh
+	@bash -n workflow/prs/*.sh workflow/monogenic/annotate_with_vep.sh workflow/run_pipeline.sh workflow/utils/prepublish_check.sh workflow/utils/cleanup_runs.sh
 	@echo "Validation checks passed."
 
 prepublish:
