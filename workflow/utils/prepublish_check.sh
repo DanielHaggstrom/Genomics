@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-PATTERN='(AKIA[0-9A-Z]{16}|BEGIN (RSA|EC|OPENSSH|PGP) PRIVATE KEY|api[_-]?key\s*=|token\s*=|secret\s*=|password\s*=|/Users/|C:/Users/|/mnt/c/Users/)'
+PATTERN='(AKIA[0-9A-Z]{16}|BEGIN (RSA|EC|OPENSSH|PGP) PRIVATE KEY|api[_-]?key\s*=|token\s*=|secret\s*=|password\s*=|/Users/|[A-Za-z]:/Users/|[A-Za-z]:\\\\Users\\\\|/mnt/c/Users/)'
 TRACKED_FILES=()
 while IFS= read -r f; do
   case "$f" in
