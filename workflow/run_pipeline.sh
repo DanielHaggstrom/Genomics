@@ -143,11 +143,6 @@ run_monogenic() {
 
   local outdir="results/monogenic/${SAMPLE_ID}"
   mkdir -p "$outdir"
-  rm -f \
-    "$outdir/shortlist_summary.md" \
-    "$outdir/high_confidence_clinvar_summary.md" \
-    "$outdir/high_confidence_clinvar_shortlist.tsv" \
-    "$outdir/high_confidence_clinvar_unique_variants.tsv"
 
   python3 workflow/monogenic/extract_priority_variants.py \
     --input-vcf "$annotated_vcf" \
