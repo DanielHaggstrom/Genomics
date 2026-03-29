@@ -14,6 +14,7 @@ This repository is publish-safe by default:
 - `workflow/monogenic/`: monogenic analysis scripts.
 - `workflow/prs/`: PRS prep and execution scripts.
 - `workflow/utils/`: utility helpers.
+- `workflow/monogenic/annotate_with_vep.sh`: optional automatic VEP + ClinVar annotation for monogenic runs.
 - `workflow/utils/cleanup_runs.sh`: removes ignored generated runs/artifacts.
 - `config/*.example*`: tracked templates.
 - `docs/`: architecture and runbooks.
@@ -62,6 +63,9 @@ Primary runtime config: `config/pipeline.env`
 Key variables:
 - `SAMPLE_ID`: logical sample identifier for monogenic outputs.
 - `ANNOTATED_VCF_GZ`: path to ClinVar-enriched VEP VCF (`.vcf.gz`).
+- `MONOGENIC_AUTORUN_VEP`: set `1` to build `ANNOTATED_VCF_GZ` automatically from a hard-filtered VCF.
+- `MONOGENIC_SOURCE_VCF_GZ`: hard-filtered source VCF for automatic monogenic annotation.
+- `MONOGENIC_VEP_DATA_DIR`, `MONOGENIC_VEP_FORKS`: cache/output location and parallelism for automatic VEP annotation.
 - `RUN_MONOGENIC` / `RUN_PRS`: enable stages in `--stage all` mode.
 - `MONOGENIC_MODE`, `MONOGENIC_MAX_AF`: triage strictness.
 - `PRS_AUTOBUILD_SAMPLESHEET`: set `1` to build from `config/paths.env`.
