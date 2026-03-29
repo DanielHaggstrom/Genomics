@@ -1,0 +1,15 @@
+bundle_id: grch38_dragen_alt_masked
+build: GRCh38
+description: >
+  Example reference bundle for a CRAM aligned against a DRAGEN GRCh38 alt-masked
+  reference with chr-prefixed contigs. Copy this file to
+  manifests/local/reference_bundles/grch38_dragen_alt_masked.yaml and fill in the real
+  local paths for the exact reference used when the CRAM was created. The
+  pipeline validates the candidate dictionary against the CRAM header before
+  marking the bundle ready.
+fasta: /path/to/reference/hg38_alt_masked.fa
+fai: /path/to/reference/hg38_alt_masked.fa.fai
+dict: /path/to/reference/hg38_alt_masked.dict
+expected_contig_prefix: chr
+download:
+  url: null

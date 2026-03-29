@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run pgsc_calc using local config templates.
+# Run pgsc_calc from explicit inputs.
 #
 # Required:
-# - config/prs_samplesheet.csv
-# - config/prs_pgs_ids.txt
+# - samplesheet CSV
+# - PGS IDs file
 # - nextflow in PATH
 # - runtime for selected profile:
 #   - docker (preferred) OR
@@ -13,53 +13,123 @@ set -euo pipefail
 #   - conda (fallback)
 #
 # Usage:
-#   bash workflow/prs/run_pgsc_calc.sh [path/to/pgs_ids.txt]
+#   bash workflow/prs/run_pgsc_calc.sh --samplesheet sample.csv --pgs-ids-file ids.txt [options]
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-if [[ -f ".env" ]]; then
-  set -a
-  # shellcheck source=/dev/null
-  source ".env"
-  set +a
-fi
-
-if [[ -f "config/secrets.env" ]]; then
-  set -a
-  # shellcheck source=/dev/null
-  source "config/secrets.env"
-  set +a
-fi
-
-SAMPLESHEET="${PGSC_SAMPLESHEET:-config/prs_samplesheet.csv}"
-DEFAULT_PGS_IDS_FILE="config/prs_pgs_ids.txt"
-PGS_IDS_FILE="${PGSC_PGS_IDS_FILE:-$DEFAULT_PGS_IDS_FILE}"
-SEX_UPDATE_FILE="config/prs_update_sex.tsv"
-OUTDIR="results/prs/pgsc_calc"
-WORKDIR="work"
+SAMPLESHEET="${PGSC_SAMPLESHEET:-}"
+PGS_IDS_FILE="${PGSC_PGS_IDS_FILE:-}"
+SEX_UPDATE_FILE="${PGSC_SEX_UPDATE_FILE:-}"
+OUTDIR="${PGSC_OUTDIR:-output/results/prs/pgsc_calc}"
+WORKDIR="${PGSC_WORKDIR:-output/work/pgsc_calc}"
 PROFILE="${PGSC_PROFILE:-auto}"
 MAX_MEMORY="${PGSC_MAX_MEMORY:-14.GB}"
 MIN_OVERLAP="${PGSC_MIN_OVERLAP:-0.75}"
 RESUME_FLAG="${PGSC_RESUME:-1}"
+GENOTYPES_CACHE="${PGSC_GENOTYPES_CACHE:-}"
 
-if [[ $# -gt 1 ]]; then
-  echo "Usage: bash workflow/prs/run_pgsc_calc.sh [path/to/pgs_ids.txt]"
+usage() {
+  cat <<EOF
+Usage: bash workflow/prs/run_pgsc_calc.sh --samplesheet sample.csv --pgs-ids-file ids.txt [options]
+
+Options:
+  --samplesheet PATH
+  --pgs-ids-file PATH
+  --sex-update-file PATH
+  --outdir PATH
+  --workdir PATH
+  --profile docker|apptainer|singularity|conda|auto
+  --max-memory 14.GB
+  --min-overlap 0.75
+  --resume 0|1
+  --genotypes-cache PATH
+EOF
+}
+
+POSITIONAL_PGS_IDS=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --samplesheet)
+      SAMPLESHEET="${2:-}"
+      shift 2
+      ;;
+    --pgs-ids-file)
+      PGS_IDS_FILE="${2:-}"
+      shift 2
+      ;;
+    --sex-update-file)
+      SEX_UPDATE_FILE="${2:-}"
+      shift 2
+      ;;
+    --outdir)
+      OUTDIR="${2:-}"
+      shift 2
+      ;;
+    --workdir)
+      WORKDIR="${2:-}"
+      shift 2
+      ;;
+    --profile)
+      PROFILE="${2:-}"
+      shift 2
+      ;;
+    --max-memory)
+      MAX_MEMORY="${2:-}"
+      shift 2
+      ;;
+    --min-overlap)
+      MIN_OVERLAP="${2:-}"
+      shift 2
+      ;;
+    --resume)
+      RESUME_FLAG="${2:-}"
+      shift 2
+      ;;
+    --genotypes-cache)
+      GENOTYPES_CACHE="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      if [[ -z "$POSITIONAL_PGS_IDS" ]]; then
+        POSITIONAL_PGS_IDS="$1"
+        shift
+      else
+        echo "Unknown argument: $1"
+        usage
+        exit 1
+      fi
+      ;;
+  esac
+done
+
+if [[ -n "$POSITIONAL_PGS_IDS" && -z "$PGS_IDS_FILE" ]]; then
+  PGS_IDS_FILE="$POSITIONAL_PGS_IDS"
+fi
+
+if [[ -z "$SAMPLESHEET" ]]; then
+  echo "--samplesheet is required"
+  usage
   exit 1
 fi
-if [[ $# -eq 1 ]]; then
-  PGS_IDS_FILE="$1"
+
+if [[ -z "$PGS_IDS_FILE" ]]; then
+  echo "--pgs-ids-file is required"
+  usage
+  exit 1
 fi
 
 if [[ ! -f "$SAMPLESHEET" ]]; then
   echo "Missing $SAMPLESHEET"
-  echo "Create it from template or run: bash workflow/prs/prepare_prs_samplesheet.sh"
   exit 1
 fi
 
 if [[ ! -f "$PGS_IDS_FILE" ]]; then
   echo "Missing $PGS_IDS_FILE"
-  echo "Copy config/prs_pgs_ids.example.txt to $DEFAULT_PGS_IDS_FILE and edit IDs."
   exit 1
 fi
 
@@ -203,7 +273,7 @@ if [[ -f "$SEX_UPDATE_FILE" ]]; then
     exit 1
   fi
 
-  sex_update_path="${ROOT_DIR}/${SEX_UPDATE_FILE}"
+  sex_update_path="$(realpath "$SEX_UPDATE_FILE")"
   escaped_sex_update_path="$(printf "%s" "$sex_update_path" | sed "s/'/'\\\\''/g")"
   PLINK2_EXTRA_ARGS="$PLINK2_EXTRA_ARGS --update-sex '$escaped_sex_update_path'"
   echo "Using sex update file: $SEX_UPDATE_FILE"
@@ -216,6 +286,9 @@ process {
 }
 EOF
 EXTRA_NEXTFLOW_ARGS+=(-c "$OVERRIDE_CONFIG")
+if [[ -n "$GENOTYPES_CACHE" ]]; then
+  EXTRA_NEXTFLOW_ARGS+=(--genotypes_cache "$GENOTYPES_CACHE")
+fi
 
 nextflow run pgscatalog/pgsc_calc \
   -profile "$PROFILE" \

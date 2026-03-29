@@ -1,0 +1,243 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Genomics Run Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sample_id",
+    "inputs",
+    "reference",
+    "analysis"
+  ],
+  "properties": {
+    "sample_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cram",
+        "crai"
+      ],
+      "properties": {
+        "cram": {
+          "type": "string",
+          "minLength": 1
+        },
+        "crai": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "reuse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existing_vcf": {
+          "type": "string",
+          "minLength": 1
+        },
+        "existing_vcf_index": {
+          "type": "string",
+          "minLength": 1
+        },
+        "existing_gvcf": {
+          "type": "string",
+          "minLength": 1
+        },
+        "existing_gvcf_index": {
+          "type": "string",
+          "minLength": 1
+        },
+        "existing_annotated_vcf": {
+          "type": "string",
+          "minLength": 1
+        },
+        "existing_annotated_vcf_index": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "build",
+        "bundle_id"
+      ],
+      "properties": {
+        "build": {
+          "type": "string",
+          "enum": [
+            "GRCh38"
+          ]
+        },
+        "bundle_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bundle_manifest": {
+          "type": "string",
+          "minLength": 1
+        },
+        "autodownload": {
+          "type": "boolean"
+        },
+        "remote_decode_probe": {
+          "type": "boolean"
+        }
+      }
+    },
+    "analysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "monogenic",
+        "prs"
+      ],
+      "properties": {
+        "monogenic": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "strict",
+                "moderate"
+              ]
+            },
+            "max_af": {
+              "type": "number",
+              "minimum": 0.0,
+              "maximum": 1.0
+            },
+            "vep_cache_dir": {
+              "type": "string",
+              "minLength": 1
+            },
+            "vep_forks": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "prs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled"
+          ],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "score_preset": {
+              "type": "string",
+              "minLength": 1
+            },
+            "pgs_ids": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^PGS[0-9]{6}$"
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "run_ancestry": {
+              "type": "boolean"
+            },
+            "reference_db": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "min_overlap": {
+              "type": "number",
+              "minimum": 0.0,
+              "maximum": 1.0
+            }
+          },
+          "allOf": [
+            {
+              "anyOf": [
+                {
+                  "required": [
+                    "score_preset"
+                  ]
+                },
+                {
+                  "required": [
+                    "pgs_ids"
+                  ]
+                },
+                {
+                  "properties": {
+                    "enabled": {
+                      "const": false
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "type": "string",
+          "enum": [
+            "docker"
+          ]
+        },
+        "max_memory": {
+          "type": "string",
+          "minLength": 1
+        },
+        "max_cpus": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "min_free_gb": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "outputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "base_dir": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cache_dir": {
+          "type": "string",
+          "minLength": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}
