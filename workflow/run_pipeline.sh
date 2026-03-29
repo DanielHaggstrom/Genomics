@@ -143,6 +143,11 @@ run_monogenic() {
 
   local outdir="results/monogenic/${SAMPLE_ID}"
   mkdir -p "$outdir"
+  rm -f \
+    "$outdir/shortlist_summary.md" \
+    "$outdir/high_confidence_clinvar_summary.md" \
+    "$outdir/high_confidence_clinvar_shortlist.tsv" \
+    "$outdir/high_confidence_clinvar_unique_variants.tsv"
 
   python3 workflow/monogenic/extract_priority_variants.py \
     --input-vcf "$annotated_vcf" \
@@ -155,14 +160,23 @@ run_monogenic() {
 
   python3 workflow/monogenic/triage_clinvar_enriched.py \
     --input-vcf "$annotated_vcf" \
-    --output-tsv "$outdir/high_confidence_clinvar_shortlist.tsv" \
-    --summary-md "$outdir/high_confidence_clinvar_summary.md" \
+    --output-tsv "$outdir/rare_clinvar_review_queue.tsv" \
     --mode "$MONOGENIC_MODE" \
     --max-af "$MONOGENIC_MAX_AF"
 
   python3 workflow/monogenic/dedup_shortlist_by_variant.py \
-    --input-tsv "$outdir/high_confidence_clinvar_shortlist.tsv" \
-    --output-tsv "$outdir/high_confidence_clinvar_unique_variants.tsv"
+    --input-tsv "$outdir/rare_clinvar_review_queue.tsv" \
+    --output-tsv "$outdir/rare_clinvar_review_unique_variants.tsv"
+
+  python3 workflow/monogenic/render_monogenic_report.py \
+    --sample-id "$SAMPLE_ID" \
+    --output-md "$outdir/monogenic_report.md" \
+    --priority-summary "$outdir/priority_variants.summary.txt" \
+    --clinvar-unique-tsv "$outdir/clinvar_plp_unique_variants.tsv" \
+    --lof-unique-tsv "$outdir/lof_unique_variants.tsv" \
+    --review-unique-tsv "$outdir/rare_clinvar_review_unique_variants.tsv" \
+    --mode "$MONOGENIC_MODE" \
+    --max-af "$MONOGENIC_MAX_AF"
 
   echo "Monogenic outputs: $outdir"
 }

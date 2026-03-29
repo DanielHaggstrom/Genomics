@@ -33,6 +33,21 @@ def parse_info(info: str) -> dict:
     return out
 
 
+def carried_alt_alleles(gt: str, alt: str) -> set[str]:
+    alts = alt.split(",")
+    carried = set()
+    for token in gt.replace("|", "/").split("/"):
+        if token in {"", ".", "0"}:
+            continue
+        try:
+            idx = int(token) - 1
+        except ValueError:
+            continue
+        if 0 <= idx < len(alts):
+            carried.add(alts[idx])
+    return carried
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-vcf", required=True)
@@ -81,12 +96,18 @@ def main() -> None:
             dp = sample_map.get("DP", ".")
             gq = sample_map.get("GQ", ".")
             ad = sample_map.get("AD", ".")
+            carried_alts = carried_alt_alleles(gt, alt) if "," in alt else set()
 
             for ann in csq_blob.split(","):
                 parts = ann.split("|")
                 if len(parts) < len(csq_fields):
                     parts += [""] * (len(csq_fields) - len(parts))
                 ann_map = dict(zip(csq_fields, parts))
+
+                if carried_alts:
+                    allele = ann_map.get("Allele", "")
+                    if allele and allele not in carried_alts:
+                        continue
 
                 consequence = ann_map.get("Consequence", "")
                 clin_sig = ann_map.get("CLIN_SIG", "")

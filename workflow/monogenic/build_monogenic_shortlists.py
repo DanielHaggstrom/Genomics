@@ -2,7 +2,6 @@
 import argparse
 import csv
 import os
-from collections import Counter
 
 
 PROTEIN_ALTERING = {
@@ -44,6 +43,27 @@ def write_tsv(path: str, rows: list[dict], header: list[str]) -> None:
         w.writerows(rows)
 
 
+def dedup_variant_gene_rows(rows: list[dict]) -> list[dict]:
+    grouped: dict[tuple[str, ...], list[dict]] = {}
+    for row in rows:
+        key = (
+            row.get("CHROM", ""),
+            row.get("POS", ""),
+            row.get("REF", ""),
+            row.get("ALT", ""),
+            row.get("GENE_SYMBOL", ""),
+            row.get("GENE_ID", ""),
+        )
+        grouped.setdefault(key, []).append(row)
+
+    picked = []
+    for key in sorted(grouped.keys()):
+        bucket = grouped[key]
+        canonical = [x for x in bucket if x.get("CANONICAL") == "YES"]
+        picked.append(canonical[0] if canonical else bucket[0])
+    return picked
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--input-tsv", required=True)
@@ -68,23 +88,13 @@ def main() -> None:
         if has_any_term(x.get("CONSEQUENCE", ""), LOF_TERMS)
         and has_any_term(x.get("CONSEQUENCE", ""), PROTEIN_ALTERING)
     ]
+    clinvar_unique = dedup_variant_gene_rows(clinvar_plp)
+    lof_unique = dedup_variant_gene_rows(lof)
 
     write_tsv(os.path.join(args.outdir, "clinvar_plp_protein_altering.tsv"), clinvar_plp, header)
+    write_tsv(os.path.join(args.outdir, "clinvar_plp_unique_variants.tsv"), clinvar_unique, header)
     write_tsv(os.path.join(args.outdir, "lof_protein_altering.tsv"), lof, header)
-
-    gene_counts = Counter((x.get("GENE_SYMBOL") or x.get("GENE_ID") or "UNKNOWN") for x in clinvar_plp)
-    top_genes = gene_counts.most_common(25)
-
-    summary_path = os.path.join(args.outdir, "shortlist_summary.md")
-    with open(summary_path, "w", encoding="utf-8") as out:
-        out.write("# Monogenic Shortlist Summary\n\n")
-        out.write(f"- Input rows: {len(rows)}\n")
-        out.write(f"- PASS rows: {len(pass_rows)}\n")
-        out.write(f"- ClinVar P/LP + protein-altering: {len(clinvar_plp)}\n")
-        out.write(f"- LoF + protein-altering: {len(lof)}\n\n")
-        out.write("## Top Genes (ClinVar P/LP + protein-altering)\n")
-        for gene, n in top_genes:
-            out.write(f"- {gene}: {n}\n")
+    write_tsv(os.path.join(args.outdir, "lof_unique_variants.tsv"), lof_unique, header)
 
 
 if __name__ == "__main__":
