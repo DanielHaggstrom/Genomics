@@ -1,0 +1,27 @@
+from __future__ import annotations
+
+import unittest
+
+from workflow.core.run_prs_stage import parse_overlap_diagnostics, safe_sampleset_name
+
+
+class PrsHelperTests(unittest.TestCase):
+    def test_safe_sampleset_name_normalizes_reserved_and_symbols(self) -> None:
+        self.assertEqual(safe_sampleset_name("SGIHZBQI9ZH"), "SGIHZBQI9ZH")
+        self.assertEqual(safe_sampleset_name("bad_name with spaces"), "bad-name-with-spaces")
+        self.assertEqual(safe_sampleset_name("reference"), "sample")
+
+    def test_parse_overlap_diagnostics(self) -> None:
+        log = """
+        Score PGS000014_hmPOS_GRCh38 fails minimum matching threshold (37.95% variants match)
+        Score PGS000838_hmPOS_GRCh38 fails minimum matching threshold (56.25% variants match)
+        Score PGS000014_hmPOS_GRCh38 fails minimum matching threshold (37.95% variants match)
+        """
+        parsed = parse_overlap_diagnostics(log)
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual(parsed[0]["score"], "PGS000014_hmPOS_GRCh38")
+        self.assertEqual(parsed[0]["match_percent"], "37.95")
+
+
+if __name__ == "__main__":
+    unittest.main()

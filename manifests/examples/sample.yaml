@@ -1,0 +1,41 @@
+sample_id: DEMO_SAMPLE_001
+
+inputs:
+  cram: /mnt/c/path/to/DEMO_SAMPLE_001.cram
+  crai: /mnt/c/path/to/DEMO_SAMPLE_001.cram.crai
+
+reuse:
+  existing_vcf: /mnt/c/path/to/DEMO_SAMPLE_001.hard-filtered.vcf.gz
+  existing_vcf_index: /mnt/c/path/to/DEMO_SAMPLE_001.hard-filtered.vcf.gz.tbi
+  existing_annotated_vcf: /mnt/c/path/to/vep_data/output/DEMO_SAMPLE_001.vep.clinvar_enriched.vcf.gz
+  existing_annotated_vcf_index: /mnt/c/path/to/vep_data/output/DEMO_SAMPLE_001.vep.clinvar_enriched.vcf.gz.tbi
+
+reference:
+  build: GRCh38
+  bundle_id: grch38_dragen_alt_masked
+  autodownload: false
+  remote_decode_probe: false
+
+analysis:
+  monogenic:
+    enabled: true
+    mode: moderate
+    max_af: 0.05
+    vep_forks: 8
+  prs:
+    enabled: true
+    score_preset: metabolic_cardio
+    run_ancestry: false
+    reference_db: null
+    min_overlap: 0.75
+
+runtime:
+  profile: docker
+  max_memory: 14.GB
+  max_cpus: 8
+  min_free_gb: 40
+
+outputs:
+  base_dir: output/results
+  cache_dir: output/cache
+  run_id: latest
