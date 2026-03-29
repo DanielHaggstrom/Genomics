@@ -156,12 +156,13 @@ fi
 mkdir -p "$OUTDIR"
 
 # Collapse PGS IDs into a comma-separated list for the pipeline argument.
-# Trim whitespace, ignore comments/blank lines, and strip CR characters to
-# tolerate Windows-edited files.
+# Trim whitespace, ignore comments/blank lines, strip trailing inline comments,
+# and strip CR characters to tolerate Windows-edited files.
 PGS_IDS="$(
   awk '
     {
       sub(/\r$/, "")
+      sub(/[[:space:]]+#.*$/, "", $0)
     }
     /^[[:space:]]*#/ {
       next
