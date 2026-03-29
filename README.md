@@ -1,130 +1,104 @@
-# Genomics WGS Risk Analysis Pipeline
+# Genomics
 
-Structured, reproducible local pipeline for personal WGS analysis with two stages:
-- Monogenic triage from ClinVar-enriched VEP output.
-- Polygenic risk scoring (PRS) via `pgscatalog/pgsc_calc`.
+Single-sample, research-use genome analysis from `CRAM/CRAI` to:
+- monogenic triage
+- targeted PRS
+- one final Markdown report
 
-This repository is publish-safe by default:
-- Real secrets and local machine paths are ignored by git.
-- Example config files with fake values are tracked.
+## Scope
 
-## Project Layout
+Supported:
+- one sample at a time
+- SNV/indel monogenic triage
+- targeted PRS from CRAM-derived genotype sites
+- reuse of trusted existing VCF or annotated VCF artifacts when declared in the manifest
 
-- `workflow/run_pipeline.sh`: single entrypoint orchestrating stages.
-- `workflow/monogenic/`: monogenic analysis scripts.
-- `workflow/prs/`: PRS prep and execution scripts.
-- `workflow/utils/`: utility helpers.
-- `workflow/monogenic/annotate_with_vep.sh`: optional automatic VEP + ClinVar annotation for monogenic runs.
-- `workflow/utils/cleanup_runs.sh`: removes ignored generated runs/artifacts.
-- `config/*.example*`: tracked templates.
-- `docs/`: architecture and runbooks.
-- `results/`, `logs/`, `work/`, `.nextflow/`: generated artifacts (ignored).
+Out of scope:
+- clinical diagnosis
+- SV/CNV pipelines
+- trio/family workflows
+- general-purpose bioinformatics utilities unrelated to the above
 
-## Quick Start
+## Run
 
-1. Bootstrap local config files:
+Preferred command:
 
 ```bash
-make bootstrap
+bash run.sh manifests/local/<sample>.yaml
 ```
 
-2. Edit local files (ignored by git):
-- `config/pipeline.env`
-- `config/secrets.env`
-- `.env`
-- `config/prs_samplesheet.csv` (or set auto-build)
-- `config/prs_pgs_ids.txt`
+Advanced direct command:
 
-3. Run validation checks:
+```bash
+nextflow run . -params-file manifests/local/<sample>.yaml -profile docker
+```
+
+The wrapper keeps Nextflow runtime state under `output/` so the repo root stays clean.
+
+## Repo Layout
+
+- `main.nf`: the pipeline graph
+- `nextflow.config`: Nextflow runtime settings
+- `run.sh`: thin launcher that keeps Nextflow state out of the repo root
+- `manifests/`: the only supported input/config surface
+- `workflow/`: implementation code for core, monogenic, and PRS stages
+- `tests/`: unit tests for the Python parts
+- `output/`: generated state and run outputs only
+
+`manifests/` is intentionally separate from `output/`: it is tracked configuration, not generated data.
+
+`manifests/` contains:
+- `manifests/examples/sample.yaml`
+- `manifests/run_manifest.schema.json`
+- `manifests/examples/score_presets.yaml`
+- `manifests/reference_bundles/*.example.yaml`
+- `manifests/local/` for private sample manifests and private reference bundle manifests
+
+`manifests/run_manifest.schema.json` is the machine-checked contract for a valid run manifest. It exists so the pipeline fails early on bad configuration instead of failing deep into a long run.
+
+`output/` is intentionally split by purpose:
+- `output/results/`: reader-facing outputs for a specific run
+- `output/cache/`: reusable expensive intermediates keyed by the input fingerprint
+- `output/work/`: Nextflow task working directories
+- `output/logs/`: launcher and Nextflow logs
+- `output/nextflow_state/`: Nextflow runtime state
+- `output/nextflow_launcher/`: launch directory used to keep root-level Nextflow files out of the repo
+
+## Reference Bundles
+
+CRAM-based stages require the exact reference used for alignment. The pipeline now separates:
+- `reference_probe`: inspect the CRAM header, contig MD5s, and aligner provenance hints
+- `validate_reference_bundle`: verify that a local FASTA/FAI/dict bundle matches the CRAM header
+
+Optional remote MD5 decode probing can be enabled with `reference.remote_decode_probe: true`, but that is only a debugging aid. It does not replace a validated local bundle.
+
+Tracked example:
+- [`grch38_dragen_alt_masked.example.yaml`](manifests/reference_bundles/grch38_dragen_alt_masked.example.yaml)
+
+## Outputs
+
+Reader-facing result:
+- `output/results/<sample>/<run_id>/report/report.md`
+
+Technical artifacts:
+- `output/results/<sample>/<run_id>/manifests/`
+- `output/results/<sample>/<run_id>/monogenic/`
+- `output/results/<sample>/<run_id>/prs/`
+- `output/cache/samples/<input_fingerprint>/...`
+
+## Development
 
 ```bash
 make validate
-make prepublish
-make clean   # optional: remove old generated runs/artifacts
+make test
+make clean
 ```
 
-4. Run pipeline:
+`make clean` removes generated runtime/output directories under `output/`.
 
-```bash
-# full pipeline
-make pipeline
+## Note On PRS
 
-# monogenic only
-make monogenic
-
-# PRS only
-make prs
-```
-
-## Pipeline Configuration
-
-Primary runtime config: `config/pipeline.env`
-
-Key variables:
-- `SAMPLE_ID`: logical sample identifier for monogenic outputs.
-- `ANNOTATED_VCF_GZ`: path to ClinVar-enriched VEP VCF (`.vcf.gz`).
-- `MONOGENIC_AUTORUN_VEP`: set `1` to build `ANNOTATED_VCF_GZ` automatically from a hard-filtered VCF.
-- `MONOGENIC_SOURCE_VCF_GZ`: hard-filtered source VCF for automatic monogenic annotation.
-- `MONOGENIC_VEP_DATA_DIR`, `MONOGENIC_VEP_FORKS`: cache/output location and parallelism for automatic VEP annotation.
-- `RUN_MONOGENIC` / `RUN_PRS`: enable stages in `--stage all` mode.
-- `MONOGENIC_MODE`, `MONOGENIC_MAX_AF`: triage strictness.
-- `PRS_AUTOBUILD_SAMPLESHEET`: set `1` to build from `config/paths.env`.
-- `PRS_SAMPLESHEET`, `PRS_PGS_IDS_FILE`: PRS inputs.
-- `PGSC_PROFILE`, `PGSC_MAX_MEMORY`, `PGSC_MIN_OVERLAP`, `PGSC_RESUME`: pgsc_calc runtime controls.
-
-## Monogenic Outputs
-
-The monogenic stage now produces one primary Markdown artifact:
-- `results/monogenic/<SAMPLE_ID>/monogenic_report.md`
-
-That report is the main human-readable entrypoint. It explains:
-- what each bucket means
-- why the broad ClinVar and rare-review buckets do not fully overlap
-- which findings are strongest
-- which findings are mostly risk/drug-response markers
-- which rare findings still need manual review
-
-Supporting TSVs are kept for detailed inspection:
-- `priority_variants.tsv`: broad transcript-level starting set
-- `clinvar_plp_protein_altering.tsv`: broad ClinVar transcript rows
-- `clinvar_plp_unique_variants.tsv`: deduplicated broad ClinVar variant-gene hits
-- `lof_protein_altering.tsv`: broad predicted LoF transcript rows
-- `lof_unique_variants.tsv`: deduplicated predicted LoF variant-gene hits
-- `rare_clinvar_review_queue.tsv`: transcript-level rare ClinVar review queue
-- `rare_clinvar_review_unique_variants.tsv`: deduplicated rare ClinVar review hits
-
-The old pair of Markdown summaries was removed because they were redundant and easy to misread:
-- `shortlist_summary.md`
-- `high_confidence_clinvar_summary.md`
-
-Optional secret files:
-- `.env` (from `.env.example`)
-- `config/secrets.env` (from `config/secrets.env.example`)
-
-Both are auto-loaded if present.
-
-## Security and Publishing
-
-Ignored by default:
-- Real env/secrets files (`.env`, `config/secrets.env`, `config/pipeline.env`, etc.)
-- Local path configs (`config/paths.env`, `config/prs_*.csv|txt|tsv` local variants)
-- Runtime/cache/output artifacts
-
-Before publishing:
-1. Confirm `git status` does not include private/local files.
-2. Keep only `*.example*` templates for configuration.
-3. Do not commit generated `results/` or `logs/`.
-
-## CI
-
-GitHub Actions workflow at `.github/workflows/ci.yml` runs:
-- Python syntax checks
-- Shell lint and syntax checks
-- Pipeline help/entrypoint check
-
-## Disclaimer
-
-This project is for research/hobby analysis and is not a medical diagnostic system.
+This repo does not score a sparse hard-filtered WGS VCF directly. It builds the union of requested PGS loci, genotypes those loci from the CRAM, and then runs `pgsc_calc`.
 
 ## License
 

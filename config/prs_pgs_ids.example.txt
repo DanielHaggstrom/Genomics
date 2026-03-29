@@ -1,5 +1,0 @@
-# One PGS ID per line.
-# Example IDs are placeholders; update to your selected scores.
-PGS000001
-PGS000002
-PGS000003

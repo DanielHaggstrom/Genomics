@@ -1,47 +1,20 @@
-# -----------------------------
-# Project-private / local-only
-# -----------------------------
-Instructions.md
-PROJECT_GAME_PLAN.md
-.env
-.env.local
-.env.*
-!.env.example
-config/pipeline.env
-config/secrets.env
-config/paths.env
-config/prs_samplesheet.csv
-config/prs_pgs_ids.txt
-config/prs_update_sex.tsv
-config/prs_batches/
+# Private/local manifests and references
+manifests/local/
 
-# -----------------------------
-# Generated outputs and logs
-# -----------------------------
-logs/
-results/
-
-# Explicit sample-specific artifacts (for clarity)
-results/vep/DEMO_SAMPLE_001*
-results/monogenic/high_confidence_clinvar*
-results/monogenic/priority_variants*
-results/monogenic/lof_protein_altering.tsv
-results/monogenic/clinvar_plp_protein_altering.tsv
-
-# -----------------------------
-# Nextflow runtime/cache
-# -----------------------------
+# Generated pipeline state
+output/
 .nextflow/
-work/
 .nextflow.log*
+work/
+results/
+cache/
+logs/
 trace.txt
 timeline.html
 report.html
 dag.*
 
-# -----------------------------
-# Bioinformatics large artifacts
-# -----------------------------
+# Large genomics artifacts
 *.vcf
 *.vcf.gz
 *.vcf.gz.tbi
@@ -69,20 +42,14 @@ dag.*
 *.bgz
 *.bgzip
 *.parquet
-
-# PLINK
 *.pgen
 *.pvar
 *.psam
-*.bed
 *.bim
 *.fam
-*.log
 *.nosex
 
-# -----------------------------
 # Python / editor
-# -----------------------------
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -91,8 +58,8 @@ __pycache__/
 .venv/
 venv/
 .python-version
-
 .idea/
 .vscode/
 *.tmp
 *.swp
+tests/.tmp/
