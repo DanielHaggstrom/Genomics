@@ -72,6 +72,31 @@ Key variables:
 - `PRS_SAMPLESHEET`, `PRS_PGS_IDS_FILE`: PRS inputs.
 - `PGSC_PROFILE`, `PGSC_MAX_MEMORY`, `PGSC_MIN_OVERLAP`, `PGSC_RESUME`: pgsc_calc runtime controls.
 
+## Monogenic Outputs
+
+The monogenic stage now produces one primary Markdown artifact:
+- `results/monogenic/<SAMPLE_ID>/monogenic_report.md`
+
+That report is the main human-readable entrypoint. It explains:
+- what each bucket means
+- why the broad ClinVar and rare-review buckets do not fully overlap
+- which findings are strongest
+- which findings are mostly risk/drug-response markers
+- which rare findings still need manual review
+
+Supporting TSVs are kept for detailed inspection:
+- `priority_variants.tsv`: broad transcript-level starting set
+- `clinvar_plp_protein_altering.tsv`: broad ClinVar transcript rows
+- `clinvar_plp_unique_variants.tsv`: deduplicated broad ClinVar variant-gene hits
+- `lof_protein_altering.tsv`: broad predicted LoF transcript rows
+- `lof_unique_variants.tsv`: deduplicated predicted LoF variant-gene hits
+- `rare_clinvar_review_queue.tsv`: transcript-level rare ClinVar review queue
+- `rare_clinvar_review_unique_variants.tsv`: deduplicated rare ClinVar review hits
+
+The old pair of Markdown summaries was removed because they were redundant and easy to misread:
+- `shortlist_summary.md`
+- `high_confidence_clinvar_summary.md`
+
 Optional secret files:
 - `.env` (from `.env.example`)
 - `config/secrets.env` (from `config/secrets.env.example`)

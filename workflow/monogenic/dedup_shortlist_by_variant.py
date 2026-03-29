@@ -16,7 +16,14 @@ def main() -> None:
 
     grouped = {}
     for row in rows:
-        key = (row.get("CHROM", ""), row.get("POS", ""), row.get("REF", ""), row.get("ALT", ""))
+        key = (
+            row.get("CHROM", ""),
+            row.get("POS", ""),
+            row.get("REF", ""),
+            row.get("ALT", ""),
+            row.get("GENE_SYMBOL", ""),
+            row.get("GENE_ID", ""),
+        )
         grouped.setdefault(key, []).append(row)
 
     picked = []

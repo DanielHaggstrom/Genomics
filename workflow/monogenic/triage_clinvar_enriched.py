@@ -2,7 +2,6 @@
 import argparse
 import gzip
 import os
-from collections import Counter
 
 
 PROTEIN_ALTERING = {
@@ -46,6 +45,21 @@ def info_map(info: str) -> dict:
         else:
             out[item] = True
     return out
+
+
+def carried_alt_alleles(gt: str, alt: str) -> set[str]:
+    alts = alt.split(",")
+    carried = set()
+    for token in gt.replace("|", "/").split("/"):
+        if token in {"", ".", "0"}:
+            continue
+        try:
+            idx = int(token) - 1
+        except ValueError:
+            continue
+        if 0 <= idx < len(alts):
+            carried.add(alts[idx])
+    return carried
 
 
 def has_any_consequence(consequence: str, terms: set[str]) -> bool:
@@ -99,7 +113,6 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--input-vcf", required=True)
     p.add_argument("--output-tsv", required=True)
-    p.add_argument("--summary-md", required=True)
     p.add_argument("--mode", choices=["strict", "moderate", "broad"], default="moderate")
     p.add_argument("--max-af", type=float, default=None)
     args = p.parse_args()
@@ -113,7 +126,6 @@ def main() -> None:
             args.max_af = 0.10
 
     os.makedirs(os.path.dirname(args.output_tsv), exist_ok=True)
-    os.makedirs(os.path.dirname(args.summary_md), exist_ok=True)
 
     csq_fields = []
     rows = []
@@ -121,7 +133,6 @@ def main() -> None:
     n_total = 0
     c_pass = c_protein = c_plp = c_review = c_noconf = c_rare = 0
     c_selected = 0
-    selected_by_reason = Counter()
 
     with gzip.open(args.input_vcf, "rt", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -146,12 +157,18 @@ def main() -> None:
             fmt_keys = fmt.split(":")
             smp_vals = sample.split(":")
             smp = dict(zip(fmt_keys, smp_vals))
+            carried_alts = carried_alt_alleles(smp.get("GT", "."), alt) if "," in alt else set()
 
             for ann in csq_blob.split(","):
                 parts = ann.split("|")
                 if len(parts) < len(csq_fields):
                     parts += [""] * (len(csq_fields) - len(parts))
                 m = dict(zip(csq_fields, parts))
+
+                if carried_alts:
+                    allele = m.get("Allele", "")
+                    if allele and allele not in carried_alts:
+                        continue
 
                 consequence = m.get("Consequence", "")
                 if not has_any_consequence(consequence, PROTEIN_ALTERING):
@@ -220,7 +237,6 @@ def main() -> None:
                 if not select:
                     continue
                 c_selected += 1
-                selected_by_reason[reason] += 1
 
                 rows.append(
                     {
@@ -273,28 +289,6 @@ def main() -> None:
         out.write("\t".join(header) + "\n")
         for r in dedup:
             out.write("\t".join(r[h] for h in header) + "\n")
-
-    top_genes = Counter((r["GENE_SYMBOL"] or r["GENE_ID"] or "UNKNOWN") for r in dedup).most_common(20)
-    with open(args.summary_md, "w", encoding="utf-8") as out:
-        out.write("# ClinVar Triage\n\n")
-        out.write(f"- Mode: {args.mode}\n")
-        out.write(f"- MAX_AF threshold: {args.max_af}\n")
-        out.write(f"- Total variants in VCF: {n_total}\n")
-        out.write(f"- PASS variants: {c_pass}\n")
-        out.write(f"- Protein-altering annotations: {c_protein}\n")
-        out.write(f"- ClinVar P/LP annotations: {c_plp}\n")
-        out.write(f"- High-review (2+ star equivalent) annotations: {c_review}\n")
-        out.write(f"- Non-conflicting annotations: {c_noconf}\n")
-        out.write(f"- Rare annotations (MAX_AF <= {args.max_af}): {c_rare}\n")
-        out.write(f"- Selected annotations before dedup: {c_selected}\n")
-        out.write(f"- Final deduplicated shortlist rows: {len(dedup)}\n\n")
-        out.write("## Selection reasons\n")
-        for k, v in selected_by_reason.most_common():
-            out.write(f"- {k}: {v}\n")
-        out.write("\n")
-        out.write("## Top genes\n")
-        for gene, n in top_genes:
-            out.write(f"- {gene}: {n}\n")
 
 
 if __name__ == "__main__":
