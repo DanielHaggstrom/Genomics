@@ -5,14 +5,6 @@ manifests/local/
 output/
 .nextflow/
 .nextflow.log*
-work/
-results/
-cache/
-logs/
-trace.txt
-timeline.html
-report.html
-dag.*
 
 # Large genomics artifacts
 *.vcf
