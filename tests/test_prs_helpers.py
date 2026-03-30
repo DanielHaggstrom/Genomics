@@ -7,7 +7,7 @@ from workflow.core.run_prs_stage import parse_overlap_diagnostics, safe_samplese
 
 class PrsHelperTests(unittest.TestCase):
     def test_safe_sampleset_name_normalizes_reserved_and_symbols(self) -> None:
-        self.assertEqual(safe_sampleset_name("DEMO_SAMPLE_001"), "DEMO_SAMPLE_001")
+        self.assertEqual(safe_sampleset_name("DEMO_SAMPLE_001"), "DEMO-SAMPLE-001")
         self.assertEqual(safe_sampleset_name("bad_name with spaces"), "bad-name-with-spaces")
         self.assertEqual(safe_sampleset_name("reference"), "sample")
 
