@@ -4,7 +4,7 @@ import pathlib
 import tempfile
 import unittest
 
-from workflow.core.validate_manifest import apply_defaults, expand_score_preset
+from workflow.core.manifest import apply_defaults, expand_score_preset
 
 
 class ValidateManifestTests(unittest.TestCase):
@@ -34,6 +34,8 @@ class ValidateManifestTests(unittest.TestCase):
         manifest = expand_score_preset(manifest)
 
         self.assertEqual(manifest["runtime"]["profile"], "docker")
+        self.assertEqual(manifest["runtime"]["linux_cache_root"], "~/.cache/genomics")
+        self.assertEqual(manifest["outputs"]["results_dir"], "output/results")
         self.assertEqual(manifest["outputs"]["run_id"], "latest")
         self.assertFalse(manifest["reference"]["remote_decode_probe"])
         self.assertEqual(manifest["analysis"]["monogenic"]["mode"], "moderate")

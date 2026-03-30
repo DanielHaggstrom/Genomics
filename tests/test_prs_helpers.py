@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from workflow.core.run_prs_stage import parse_overlap_diagnostics, safe_sampleset_name
+from workflow.stages.prs import parse_overlap_diagnostics, safe_sampleset_name
 
 
 class PrsHelperTests(unittest.TestCase):

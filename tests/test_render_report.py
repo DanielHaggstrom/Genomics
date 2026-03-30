@@ -13,11 +13,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class RenderReportTests(unittest.TestCase):
-    def test_render_unified_report_writes_markdown(self) -> None:
+    def test_render_report_writes_markdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             results_dir = tmp / "results" / "TEST" / "latest"
-            results_dir.mkdir(parents=True, exist_ok=True)
+            report_dir = results_dir / "report"
+            manifests_dir = results_dir / "manifests"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            manifests_dir.mkdir(parents=True, exist_ok=True)
 
             scores_path = tmp / "aggregated_scores.txt.gz"
             with gzip.open(scores_path, "wt", encoding="utf-8") as handle:
@@ -26,71 +29,85 @@ class RenderReportTests(unittest.TestCase):
 
             context = {
                 "sample_id": "TEST",
-                "results_run_dir": str(results_dir),
-                "cache_dir": str(tmp / "cache"),
-                "manifest": {
-                    "inputs": {
+                "input_fingerprint": {"id": "fingerprint"},
+                "inputs": {
+                    "original": {
                         "cram": "C:\\Data\\sample.cram",
                         "crai": "C:\\Data\\sample.cram.crai",
                     },
+                    "active": {
+                        "cram": "/home/user/.cache/genomics/staging/sample.cram",
+                        "crai": "/home/user/.cache/genomics/staging/sample.cram.crai",
+                    },
+                    "staged": {"cram": True, "crai": True},
+                },
+                "runtime": {
+                    "linux_cache_root": "/home/user/.cache/genomics",
+                },
+                "results": {
+                    "run_dir": str(results_dir),
+                    "report_dir": str(report_dir),
+                    "manifests_dir": str(manifests_dir),
+                },
+                "manifest": {
                     "analysis": {
                         "monogenic": {"enabled": True},
                         "prs": {"enabled": True},
                     },
-                    "outputs": {
-                        "base_dir": "output/results",
-                        "cache_dir": "output/cache",
-                        "run_id": "latest",
+                },
+                "reference_probe": {
+                    "status": "ok",
+                    "summary": {
+                        "contig_count": 25,
+                        "first_contigs": ["chr1", "chr2"],
+                        "contig_prefix": "chr",
+                        "all_contigs_have_md5": True,
                     },
+                    "provenance_hints": {
+                        "aligner": "DRAGEN",
+                        "ref_dir": "/refs/dragen/11",
+                    },
+                    "remote_decode_probe": {"status": "ok"},
                 },
-                "input_fingerprint": {"id": "fingerprint"},
-                "normalized_inputs": {
-                    "cram": "/mnt/c/data/sample.cram",
-                    "crai": "/mnt/c/data/sample.cram.crai",
+                "reference_bundle": {
+                    "status": "ready",
+                    "fasta": "/home/user/.cache/genomics/reference/hg38.fa",
+                    "comparison": {"exact_dictionary_match": True, "extra_contigs": []},
                 },
-                "contig_prefix": "chr",
-            }
-            reference = {"status": "ready"}
-            reference_probe = {
-                "status": "ok",
-                "summary": {
-                    "contig_count": 25,
-                    "first_contigs": ["chr1", "chr2"],
-                    "all_contigs_have_md5": True,
-                },
-                "provenance_hints": {
-                    "aligner": "DRAGEN",
-                    "ht_reference": "/refs/hg38.fa",
-                    "ref_dir": "/refs/dragen/11",
-                },
-                "remote_decode_probe": {
-                    "attempted": False,
-                    "status": "not_attempted",
-                    "message": "disabled",
-                },
+                "upstream_sample_name": "TEST",
             }
             monogenic = {
                 "status": "ok",
+                "source_mode": "called_from_cram",
                 "summary": {"priority_rows_after_dedup": "10", "total_variant_records_seen": "20"},
-                "artifacts": {},
+                "artifacts": {
+                    "annotated_vcf": "/cache/annotated.vcf.gz",
+                    "clinvar_unique_tsv": "/cache/clinvar.tsv",
+                    "lof_unique_tsv": "/cache/lof.tsv",
+                    "review_unique_tsv": "/cache/review.tsv",
+                },
             }
             prs = {
                 "status": "ok",
+                "dense_genotypes": {
+                    "status": "ok",
+                    "summary": {"union_sites": 12345},
+                    "artifacts": {
+                        "dense_vcf": "/cache/dense.vcf.gz",
+                        "targets_vcf": "/cache/targets.vcf.gz",
+                    },
+                },
                 "artifacts": {
                     "aggregated_scores": str(scores_path),
                 },
             }
 
             context_path = tmp / "context.json"
-            reference_probe_path = tmp / "reference_probe.json"
-            reference_path = tmp / "reference.json"
             monogenic_path = tmp / "monogenic.json"
             prs_path = tmp / "prs.json"
             summary_path = tmp / "summary.json"
             for path, payload in [
                 (context_path, context),
-                (reference_probe_path, reference_probe),
-                (reference_path, reference),
                 (monogenic_path, monogenic),
                 (prs_path, prs),
             ]:
@@ -100,13 +117,10 @@ class RenderReportTests(unittest.TestCase):
                 [
                     "python3",
                     "-m",
-                    "workflow.core.render_unified_report",
+                    "workflow.reporting.report",
+                    "render",
                     "--context",
                     str(context_path),
-                    "--reference-probe",
-                    str(reference_probe_path),
-                    "--reference-stage",
-                    str(reference_path),
                     "--monogenic-stage",
                     str(monogenic_path),
                     "--prs-stage",
@@ -119,14 +133,14 @@ class RenderReportTests(unittest.TestCase):
                 check=True,
             )
 
-            report_path = results_dir / "report" / "report.md"
+            report_path = report_dir / "report.md"
             self.assertTrue(report_path.exists())
             report_text = report_path.read_text(encoding="utf-8")
             self.assertIn("Genome Report: TEST", report_text)
-            self.assertIn("CRAM: `C:\\Data\\sample.cram`", report_text)
-            self.assertIn("Results directory: `output/results/TEST/latest`", report_text)
-            self.assertIn("CRAM reference probe: `ok`", report_text)
-            self.assertIn("Local reference bundle: validated for all CRAM contigs.", report_text)
+            self.assertIn("CRAM input: `C:\\Data\\sample.cram`", report_text)
+            self.assertIn("Active CRAM path: `/home/user/.cache/genomics/staging/sample.cram`", report_text)
+            self.assertIn("Reference probe: `ok`", report_text)
+            self.assertIn("Dense PRS VCF: `/cache/dense.vcf.gz`", report_text)
 
 
 if __name__ == "__main__":

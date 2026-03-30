@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from workflow.core.reference_lib import compare_sequence_catalogs, extract_reference_hints, parse_sq_entries
+from workflow.core.reference import compare_sequence_catalogs, extract_reference_hints, parse_sq_entries
 
 
 class ReferenceLibTests(unittest.TestCase):
