@@ -12,9 +12,19 @@ MANIFEST="$1"
 PROFILE="${2:-docker}"
 ABS_MANIFEST="$(cd "$(dirname "$MANIFEST")" && pwd)/$(basename "$MANIFEST")"
 
-mkdir -p "$ROOT_DIR/output/logs" "$ROOT_DIR/output/nextflow_state/home" "$ROOT_DIR/output/nextflow_launcher"
-export NXF_HOME="$ROOT_DIR/output/nextflow_state/home"
+PROJECT_CACHE_ROOT="$(
+  PYTHONPATH="$ROOT_DIR" python3 -m workflow.core.manifest print-project-cache-root \
+    --manifest "$ABS_MANIFEST"
+)"
 
-cd "$ROOT_DIR/output/nextflow_launcher"
+mkdir -p "$PROJECT_CACHE_ROOT/nextflow/home" "$PROJECT_CACHE_ROOT/nextflow/launcher" "$PROJECT_CACHE_ROOT/nextflow/work"
+export NXF_HOME="$PROJECT_CACHE_ROOT/nextflow/home"
 
-nextflow -log "$ROOT_DIR/output/logs/nextflow.log" run "$ROOT_DIR" -params-file "$ABS_MANIFEST" -profile "$PROFILE"
+cd "$PROJECT_CACHE_ROOT/nextflow/launcher"
+
+nextflow \
+  -log "$PROJECT_CACHE_ROOT/nextflow/nextflow.log" \
+  run "$ROOT_DIR" \
+  -params-file "$ABS_MANIFEST" \
+  -profile "$PROFILE" \
+  -work-dir "$PROJECT_CACHE_ROOT/nextflow/work"

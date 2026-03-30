@@ -2,16 +2,19 @@
 
 Single-sample, research-use genome analysis from `CRAM/CRAI` to:
 - monogenic triage
-- targeted PRS
+- dense PRS genotypes plus PRS scoring
 - one final Markdown report
 
 ## Scope
 
 Supported:
 - one sample at a time
-- SNV/indel monogenic triage
-- targeted PRS from CRAM-derived genotype sites
-- reuse of trusted existing VCF or annotated VCF artifacts when declared in the manifest
+- CRAM-first SNV/indel monogenic triage
+- PRS from a dense genotype VCF generated from the CRAM
+- explicit stage-boundary imports for:
+  - called VCF
+  - annotated VCF
+  - dense PRS VCF
 
 Out of scope:
 - clinical diagnosis
@@ -27,66 +30,109 @@ Preferred command:
 bash run.sh manifests/local/<sample>.yaml
 ```
 
-Advanced direct command:
+Direct command:
 
 ```bash
 nextflow run . -params-file manifests/local/<sample>.yaml -profile docker
 ```
 
-The wrapper keeps Nextflow runtime state under `output/` so the repo root stays clean.
+The wrapper resolves the Linux-side cache root from the manifest and keeps Nextflow runtime state there, so the repo only keeps final results.
+
+## Pipeline Shape
+
+Canonical path:
+
+```text
+CRAM/CRAI
+-> validated manifest
+-> prepared context (reference probe + bundle validation + WSL-native staging)
+-> monogenic stage
+-> dense PRS genotypes
+-> PRS scoring
+-> one report
+```
+
+Reuse is allowed only at explicit stage boundaries:
+- `reuse.called_vcf`
+- `reuse.annotated_vcf`
+- `reuse.prs_dense_vcf`
+
+Those imports do not create alternate execution graphs. They only skip the stage that would normally generate the same artifact.
 
 ## Repo Layout
 
 - `main.nf`: the pipeline graph
 - `nextflow.config`: Nextflow runtime settings
-- `run.sh`: thin launcher that keeps Nextflow state out of the repo root
-- `manifests/`: the only supported input/config surface
-- `workflow/`: implementation code for core, monogenic, and PRS stages
-- `tests/`: unit tests for the Python parts
-- `output/`: generated state and run outputs only
+- `run.sh`: the only user-facing shell entrypoint
+- `manifests/`: tracked examples plus schema; private manifests live under ignored `manifests/local/`
+- `workflow/core/`: manifest, runtime, and reference/context logic
+- `workflow/stages/`: monogenic and PRS stage implementations
+- `workflow/reporting/`: report rendering and outcome enforcement
+- `tests/`: unit tests
+- `output/results/`: final run outputs only
 
-`manifests/` is intentionally separate from `output/`: it is tracked configuration, not generated data.
+The heavy runtime/cache state lives under `runtime.linux_cache_root`, not in the repo.
 
-`manifests/` contains:
+## Manifest
+
+Example tracked manifest:
 - `manifests/examples/sample.yaml`
+
+Main fields:
+- `sample_id`
+- `inputs.cram`
+- `inputs.crai`
+- `reference.build`
+- `reference.bundle_id`
+- `analysis.monogenic`
+- `analysis.prs`
+- `runtime.linux_cache_root`
+- `outputs.results_dir`
+
+PRS score lists can come from either:
+- `analysis.prs.score_preset`
+- `analysis.prs.pgs_ids`
+
+Tracked example presets live in:
 - `manifests/examples/score_presets.yaml`
-- `manifests/examples/reference_bundles/*.yaml`
-- `manifests/schema/run_manifest.schema.json`
-- `manifests/local/` for private sample manifests, private score presets, and private reference bundle manifests
 
-`manifests/schema/run_manifest.schema.json` is the machine-checked contract for a valid run manifest. It exists so the pipeline fails early on bad configuration instead of failing deep into a long run.
-
-Tracked example files under `manifests/examples/` are intentionally generic. Real sample manifests, real reference paths, and personal PRS presets belong under `manifests/local/`, which is ignored by git.
-
-`output/` is intentionally split by purpose:
-- `output/results/`: reader-facing outputs for a specific run
-- `output/cache/`: reusable expensive intermediates keyed by the input fingerprint
-- `output/work/`: Nextflow task working directories
-- `output/logs/`: launcher and Nextflow logs
-- `output/nextflow_state/`: Nextflow runtime state
-- `output/nextflow_launcher/`: launch directory used to keep root-level Nextflow files out of the repo
+Private sample manifests, private reference bundle manifests, and private score presets belong under ignored `manifests/local/`.
 
 ## Reference Bundles
 
-CRAM-based stages require the exact reference used for alignment. The pipeline now separates:
-- `reference_probe`: inspect the CRAM header, contig MD5s, and aligner provenance hints
-- `validate_reference_bundle`: verify that a local FASTA/FAI/dict bundle matches the CRAM header
+CRAM-based stages require the exact reference used for alignment.
 
-Optional remote MD5 decode probing can be enabled with `reference.remote_decode_probe: true`, but that is only a debugging aid. It does not replace a validated local bundle.
+The pipeline now handles that in `PREPARE_CONTEXT` by:
+- probing the CRAM header
+- extracting contig MD5s and provenance hints
+- validating a local FASTA/FAI/dict bundle against the CRAM header
+- staging heavy reference files into Linux-native cache when needed
+
+Optional remote MD5 decode probing is available for diagnostics, but it does not replace a validated local bundle.
 
 Tracked example:
-- [`grch38_dragen_alt_masked.yaml`](manifests/examples/reference_bundles/grch38_dragen_alt_masked.yaml)
+- `manifests/examples/reference_bundles/grch38_dragen_alt_masked.yaml`
 
 ## Outputs
 
-Reader-facing result:
+Final reader-facing result:
 - `output/results/<sample>/<run_id>/report/report.md`
 
-Technical artifacts:
-- `output/results/<sample>/<run_id>/manifests/`
-- `output/results/<sample>/<run_id>/monogenic/`
-- `output/results/<sample>/<run_id>/prs/`
-- `output/cache/samples/<input_fingerprint>/...`
+Technical manifests:
+- `output/results/<sample>/<run_id>/report/artifact_manifest.json`
+
+Heavy cache/work state:
+- `<runtime.linux_cache_root>/<project-cache-id>/...`
+
+## Performance Model
+
+The pipeline automatically stages heavy inputs from `/mnt/c/...` or Windows paths into Linux-native cache, then runs heavy work there.
+
+Performance-sensitive stages are structured as scatter/gather:
+- monogenic calling is sharded by chromosome plus one `alt` shard
+- dense PRS genotyping is sharded by chromosome plus one `alt` shard
+
+That avoids the earlier design where PRS walked chromosomes in one long serial shell loop and monogenic ran as one giant whole-genome caller task.
 
 ## Development
 
@@ -94,13 +140,11 @@ Technical artifacts:
 make validate
 make test
 make clean
+make clean-cache
 ```
 
-`make clean` removes generated runtime/output directories under `output/`.
-
-## Note On PRS
-
-This repo does not score a sparse hard-filtered WGS VCF directly. It builds the union of requested PGS loci, genotypes those loci from the CRAM, and then runs `pgsc_calc`.
+`make clean` removes repo-facing results only.  
+`make clean-cache` removes Linux-side cache/work state for this project.
 
 ## License
 

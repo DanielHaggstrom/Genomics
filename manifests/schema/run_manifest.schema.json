@@ -37,27 +37,15 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "existing_vcf": {
+        "called_vcf": {
           "type": "string",
           "minLength": 1
         },
-        "existing_vcf_index": {
+        "annotated_vcf": {
           "type": "string",
           "minLength": 1
         },
-        "existing_gvcf": {
-          "type": "string",
-          "minLength": 1
-        },
-        "existing_gvcf_index": {
-          "type": "string",
-          "minLength": 1
-        },
-        "existing_annotated_vcf": {
-          "type": "string",
-          "minLength": 1
-        },
-        "existing_annotated_vcf_index": {
+        "prs_dense_vcf": {
           "type": "string",
           "minLength": 1
         }
@@ -115,17 +103,14 @@
               "type": "string",
               "enum": [
                 "strict",
-                "moderate"
+                "moderate",
+                "broad"
               ]
             },
             "max_af": {
               "type": "number",
               "minimum": 0.0,
               "maximum": 1.0
-            },
-            "vep_cache_dir": {
-              "type": "string",
-              "minLength": 1
             },
             "vep_forks": {
               "type": "integer",
@@ -218,6 +203,10 @@
         "min_free_gb": {
           "type": "integer",
           "minimum": 1
+        },
+        "linux_cache_root": {
+          "type": "string",
+          "minLength": 1
         }
       }
     },
@@ -225,11 +214,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "base_dir": {
-          "type": "string",
-          "minLength": 1
-        },
-        "cache_dir": {
+        "results_dir": {
           "type": "string",
           "minLength": 1
         },
