@@ -38,10 +38,19 @@ PRS_DEFAULTS = {
 }
 
 
-def load_presets() -> dict[str, list[str]]:
-    presets_path = REPO_ROOT / "manifests" / "score_presets.yaml"
-    data = load_yaml(presets_path) or {}
-    return {str(key): list(value or []) for key, value in data.items()}
+def load_presets(manifest_path: pathlib.Path | None = None) -> dict[str, list[str]]:
+    candidates: list[pathlib.Path] = []
+    candidates.append(REPO_ROOT / "manifests" / "examples" / "score_presets.yaml")
+    if manifest_path is not None:
+        candidates.append(manifest_path.parent / "score_presets.yaml")
+
+    merged: dict[str, list[str]] = {}
+    for path in candidates:
+        if not path.exists():
+            continue
+        data = load_yaml(path) or {}
+        merged.update({str(key): list(value or []) for key, value in data.items()})
+    return merged
 
 
 def apply_defaults(manifest: dict) -> dict:
@@ -69,7 +78,7 @@ def apply_defaults(manifest: dict) -> dict:
     return out
 
 
-def expand_score_preset(manifest: dict) -> dict:
+def expand_score_preset(manifest: dict, manifest_path: pathlib.Path | None = None) -> dict:
     prs = manifest["analysis"]["prs"]
     if not prs.get("enabled"):
         return manifest
@@ -82,7 +91,7 @@ def expand_score_preset(manifest: dict) -> dict:
     if not preset_name:
         return manifest
 
-    presets = load_presets()
+    presets = load_presets(manifest_path)
     if preset_name not in presets:
         raise SystemExit(f"Unknown PRS score_preset: {preset_name}")
 
@@ -104,7 +113,7 @@ def main() -> None:
         raise SystemExit("Manifest must be a YAML object at the top level")
 
     manifest = apply_defaults(manifest)
-    manifest = expand_score_preset(manifest)
+    manifest = expand_score_preset(manifest, manifest_path)
 
     errors = validate_payload(manifest, schema)
     if errors:

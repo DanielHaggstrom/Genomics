@@ -49,12 +49,14 @@ The wrapper keeps Nextflow runtime state under `output/` so the repo root stays 
 
 `manifests/` contains:
 - `manifests/examples/sample.yaml`
-- `manifests/run_manifest.schema.json`
 - `manifests/examples/score_presets.yaml`
-- `manifests/reference_bundles/*.example.yaml`
-- `manifests/local/` for private sample manifests and private reference bundle manifests
+- `manifests/examples/reference_bundles/*.yaml`
+- `manifests/schema/run_manifest.schema.json`
+- `manifests/local/` for private sample manifests, private score presets, and private reference bundle manifests
 
-`manifests/run_manifest.schema.json` is the machine-checked contract for a valid run manifest. It exists so the pipeline fails early on bad configuration instead of failing deep into a long run.
+`manifests/schema/run_manifest.schema.json` is the machine-checked contract for a valid run manifest. It exists so the pipeline fails early on bad configuration instead of failing deep into a long run.
+
+Tracked example files under `manifests/examples/` are intentionally generic. Real sample manifests, real reference paths, and personal PRS presets belong under `manifests/local/`, which is ignored by git.
 
 `output/` is intentionally split by purpose:
 - `output/results/`: reader-facing outputs for a specific run
@@ -73,7 +75,7 @@ CRAM-based stages require the exact reference used for alignment. The pipeline n
 Optional remote MD5 decode probing can be enabled with `reference.remote_decode_probe: true`, but that is only a debugging aid. It does not replace a validated local bundle.
 
 Tracked example:
-- [`grch38_dragen_alt_masked.example.yaml`](manifests/reference_bundles/grch38_dragen_alt_masked.example.yaml)
+- [`grch38_dragen_alt_masked.yaml`](manifests/examples/reference_bundles/grch38_dragen_alt_masked.yaml)
 
 ## Outputs
 

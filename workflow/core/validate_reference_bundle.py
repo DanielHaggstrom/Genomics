@@ -28,8 +28,7 @@ def resolve_bundle_manifest(context: dict) -> pathlib.Path | None:
     bundle_id = ref_cfg["bundle_id"]
     candidates = [
         REPO_ROOT / "manifests" / "local" / "reference_bundles" / f"{bundle_id}.yaml",
-        REPO_ROOT / "manifests" / "reference_bundles" / f"{bundle_id}.yaml",
-        REPO_ROOT / "manifests" / "reference_bundles" / f"{bundle_id}.example.yaml",
+        REPO_ROOT / "manifests" / "examples" / "reference_bundles" / f"{bundle_id}.yaml",
     ]
     for candidate in candidates:
         if candidate.exists():

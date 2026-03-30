@@ -52,7 +52,7 @@ process VALIDATE_MANIFEST {
     """
     PYTHONPATH="${projectDir}" python3 -m workflow.core.validate_manifest \
       --manifest "$manifest" \
-      --schema "${projectDir}/manifests/run_manifest.schema.json" \
+      --schema "${projectDir}/manifests/schema/run_manifest.schema.json" \
       --output validated_manifest.json
     """
 }

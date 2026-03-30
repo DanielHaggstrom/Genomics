@@ -21,7 +21,7 @@ validate:
 
 validate-manifest:
 	@test -n "$(RUN)" || (echo "Set RUN=manifests/<sample>.yaml"; exit 1)
-	@PYTHONPATH=. python3 -m workflow.core.validate_manifest --manifest "$(RUN)" --schema manifests/run_manifest.schema.json --output /tmp/genomics_manifest.validate.json
+	@PYTHONPATH=. python3 -m workflow.core.validate_manifest --manifest "$(RUN)" --schema manifests/schema/run_manifest.schema.json --output /tmp/genomics_manifest.validate.json
 	@echo "Manifest is valid."
 
 test:

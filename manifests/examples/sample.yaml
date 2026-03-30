@@ -24,7 +24,8 @@ analysis:
     vep_forks: 8
   prs:
     enabled: true
-    score_preset: demo
+    pgs_ids:
+      - PGS999001
     run_ancestry: false
     reference_db: null
     min_overlap: 0.75
