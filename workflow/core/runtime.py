@@ -19,6 +19,7 @@ from jsonschema import Draft202012Validator
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 WINDOWS_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+MEMORY_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([gGmM][bB]?|\.[gG][bB]?|\.[mM][bB]?)\s*$")
 
 
 def load_yaml(path: str | pathlib.Path) -> Any:
@@ -382,6 +383,120 @@ def format_java_memory(raw: str) -> str:
     lowered = lowered.replace(".gb", "g").replace("gb", "g")
     lowered = lowered.replace(".mb", "m").replace("mb", "m")
     return lowered
+
+
+def parse_memory_to_mb(raw: str | int | float) -> int:
+    if isinstance(raw, (int, float)):
+        return int(raw)
+
+    value = str(raw).strip()
+    match = MEMORY_RE.match(value)
+    if not match:
+        raise ValueError(f"Unsupported memory value: {raw}")
+
+    amount = float(match.group(1))
+    unit = match.group(2).lower().replace(".", "")
+    if unit in {"g", "gb"}:
+        return int(amount * 1024)
+    if unit in {"m", "mb"}:
+        return int(amount)
+    raise ValueError(f"Unsupported memory unit in value: {raw}")
+
+
+def parse_memory_to_gb(raw: str | int | float) -> float:
+    return parse_memory_to_mb(raw) / 1024.0
+
+
+def format_java_memory_mb(memory_mb: int) -> str:
+    return f"{int(memory_mb)}m"
+
+
+def plan_worker_pool(
+    *,
+    stage_name: str,
+    shard_count: int,
+    max_cpus: int,
+    max_memory: str,
+    requested_workers: int | None = None,
+    requested_pairhmm_threads: int | None = None,
+    default_worker_cap: int,
+    default_pairhmm_cap: int,
+    min_memory_per_worker_gb: float,
+    reserve_memory_gb: float = 1.0,
+    target_cpus_per_worker: int = 2,
+    free_gb: float | None = None,
+    min_free_gb: float | None = None,
+    low_disk_headroom_gb: float = 10.0,
+) -> dict[str, Any]:
+    shard_count = max(1, int(shard_count))
+    max_cpus = max(1, int(max_cpus))
+    total_memory_mb = max(1024, parse_memory_to_mb(max_memory))
+    usable_memory_mb = max(1024, total_memory_mb - int(reserve_memory_gb * 1024))
+    min_memory_per_worker_mb = max(1024, int(min_memory_per_worker_gb * 1024))
+
+    cpu_limit_for_target = max(1, max_cpus // max(1, target_cpus_per_worker))
+    memory_worker_limit = max(1, usable_memory_mb // min_memory_per_worker_mb)
+    disk_worker_limit = shard_count
+    disk_headroom_gb = None
+    if free_gb is not None and min_free_gb is not None:
+        disk_headroom_gb = max(0.0, float(free_gb) - float(min_free_gb))
+        if disk_headroom_gb < low_disk_headroom_gb:
+            disk_worker_limit = min(disk_worker_limit, 2)
+
+    default_workers = min(shard_count, default_worker_cap, cpu_limit_for_target, memory_worker_limit, disk_worker_limit)
+    hard_worker_limit = min(shard_count, max_cpus, memory_worker_limit, disk_worker_limit)
+    if requested_workers is None:
+        workers = max(1, default_workers)
+        worker_source = "automatic"
+    else:
+        workers = max(1, min(int(requested_workers), hard_worker_limit))
+        worker_source = "override"
+
+    cpu_budget_per_worker = max(1, max_cpus // workers)
+    default_pairhmm_threads = max(1, min(default_pairhmm_cap, cpu_budget_per_worker))
+    hard_pairhmm_limit = max(1, min(cpu_budget_per_worker, default_pairhmm_cap))
+    if requested_pairhmm_threads is None:
+        pairhmm_threads = default_pairhmm_threads
+        pairhmm_source = "automatic"
+    else:
+        pairhmm_threads = max(1, min(int(requested_pairhmm_threads), hard_pairhmm_limit))
+        pairhmm_source = "override"
+
+    java_memory_mb = max(1024, usable_memory_mb // workers)
+    plan = {
+        "stage_name": stage_name,
+        "shard_count": shard_count,
+        "workers": workers,
+        "pairhmm_threads": pairhmm_threads,
+        "java_memory_mb": java_memory_mb,
+        "java_memory": format_java_memory_mb(java_memory_mb),
+        "worker_source": worker_source,
+        "pairhmm_source": pairhmm_source,
+        "requested_workers": requested_workers,
+        "requested_pairhmm_threads": requested_pairhmm_threads,
+        "limits": {
+            "default_worker_cap": default_worker_cap,
+            "cpu_limit_for_target": cpu_limit_for_target,
+            "memory_worker_limit": memory_worker_limit,
+            "disk_worker_limit": disk_worker_limit,
+            "hard_worker_limit": hard_worker_limit,
+            "hard_pairhmm_limit": hard_pairhmm_limit,
+        },
+        "resources": {
+            "max_cpus": max_cpus,
+            "max_memory_mb": total_memory_mb,
+            "usable_memory_mb": usable_memory_mb,
+            "min_memory_per_worker_mb": min_memory_per_worker_mb,
+            "free_gb": free_gb,
+            "min_free_gb": min_free_gb,
+            "disk_headroom_gb": disk_headroom_gb,
+        },
+    }
+    if requested_workers is not None and int(requested_workers) != workers:
+        plan["worker_override_note"] = f"Requested workers capped to {workers} by available resources."
+    if requested_pairhmm_threads is not None and int(requested_pairhmm_threads) != pairhmm_threads:
+        plan["pairhmm_override_note"] = f"Requested pairhmm_threads capped to {pairhmm_threads} by per-worker CPU budget."
+    return plan
 
 
 def run_tasks_in_parallel(

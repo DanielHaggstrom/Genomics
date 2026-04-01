@@ -98,6 +98,10 @@ Main fields:
 - `analysis.monogenic`
 - `analysis.prs`
 - `analysis.prs.sample_sex`
+- `analysis.monogenic.workers`
+- `analysis.monogenic.pairhmm_threads`
+- `analysis.prs.workers`
+- `analysis.prs.pairhmm_threads`
 - `runtime.linux_cache_root`
 - `outputs.results_dir`
 
@@ -113,6 +117,14 @@ Execution mode is derived from the enabled analysis branches:
 The pipeline intentionally rejects manifests where both branches are disabled.
 
 If `analysis.prs.sample_sex` is set to `male` or `female`, the PRS compatibility step keeps sex chromosomes and writes a one-sample `.psam` for downstream tools. If it is omitted, PRS compatibility falls back to autosomes only.
+
+The worker and `pairhmm_threads` fields are optional narrow overrides. If omitted, the pipeline now chooses them automatically from:
+- `runtime.max_cpus`
+- `runtime.max_memory`
+- shard count for the stage
+- current free-disk headroom relative to `runtime.min_free_gb`
+
+The default behavior is to use the automatic planner and only set those fields when you need to tune a run deliberately.
 
 Tracked example presets live in:
 - `manifests/examples/score_presets.yaml`
@@ -157,6 +169,11 @@ The pipeline automatically stages heavy inputs from `/mnt/c/...` or Windows path
 Performance-sensitive stages are structured as scatter/gather:
 - monogenic calling is sharded by chromosome plus one `alt` shard
 - dense PRS genotyping is sharded by chromosome plus one `alt` shard
+
+Worker selection is also automatic now:
+- monogenic and PRS dense-genotype stages size their worker pools from available CPU, memory, shard count, and disk headroom
+- optional per-stage overrides stay narrow and explicit in the manifest
+- live tuning during a run is not supported yet; the sane operator path is still stop, adjust settings, and relaunch with cache reuse
 
 That avoids the earlier design where PRS walked chromosomes in one long serial shell loop and monogenic ran as one giant whole-genome caller task.
 

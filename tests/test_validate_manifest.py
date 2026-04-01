@@ -42,6 +42,10 @@ class ValidateManifestTests(unittest.TestCase):
         self.assertEqual(manifest["outputs"]["run_id"], "latest")
         self.assertFalse(manifest["reference"]["remote_decode_probe"])
         self.assertEqual(manifest["analysis"]["monogenic"]["mode"], "moderate")
+        self.assertIsNone(manifest["analysis"]["monogenic"]["workers"])
+        self.assertIsNone(manifest["analysis"]["monogenic"]["pairhmm_threads"])
+        self.assertIsNone(manifest["analysis"]["prs"]["workers"])
+        self.assertIsNone(manifest["analysis"]["prs"]["pairhmm_threads"])
         self.assertEqual(manifest["analysis"]["prs"]["pgs_ids"], ["PGS999001"])
 
     def test_local_score_presets_override_examples(self) -> None:

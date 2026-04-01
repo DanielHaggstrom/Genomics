@@ -29,6 +29,8 @@ MONOGENIC_DEFAULTS = {
     "mode": "moderate",
     "max_af": 0.05,
     "vep_forks": 8,
+    "workers": None,
+    "pairhmm_threads": None,
 }
 
 PRS_DEFAULTS = {
@@ -37,6 +39,8 @@ PRS_DEFAULTS = {
     "reference_db": None,
     "min_overlap": 0.75,
     "sample_sex": None,
+    "workers": None,
+    "pairhmm_threads": None,
 }
 
 

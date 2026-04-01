@@ -16,9 +16,10 @@ from workflow.core.runtime import (
     complete_artifact,
     ensure_dir,
     ensure_docker_ready,
-    format_java_memory,
     hash_strings,
     load_json,
+    parse_memory_to_mb,
+    plan_worker_pool,
     remove_if_exists,
     run_command,
     run_tasks_in_parallel,
@@ -436,17 +437,7 @@ def build_pgsc_input_pfile(
     chrom_filter = "1-22, X, Y, XY" if sex_code else "1-22"
     max_cpus = max(int(context["manifest"]["runtime"]["max_cpus"]), 1)
     thread_count = max(1, min(4, max_cpus // 2 or 1))
-    memory_raw = context["manifest"]["runtime"]["max_memory"].lower().replace(" ", "")
-    if memory_raw.endswith(".gb"):
-        memory_mb = int(float(memory_raw[:-3]) * 1024)
-    elif memory_raw.endswith("gb"):
-        memory_mb = int(float(memory_raw[:-2]) * 1024)
-    elif memory_raw.endswith(".mb"):
-        memory_mb = int(float(memory_raw[:-3]))
-    elif memory_raw.endswith("mb"):
-        memory_mb = int(float(memory_raw[:-2]))
-    else:
-        memory_mb = int(float(memory_raw.rstrip("gm")))
+    memory_mb = parse_memory_to_mb(context["manifest"]["runtime"]["max_memory"])
     log_path = prep_root / "plink2.make_pfile.log"
 
     if not complete_pfile(output_prefix):
@@ -654,11 +645,20 @@ def main() -> None:
             else:
                 docker_bin = context["host_checks"]["docker"] or "docker"
                 ensure_docker_ready(docker_bin)
-                max_cpus = max(int(context["manifest"]["runtime"]["max_cpus"]), 1)
-                max_workers = max(1, min(3, max_cpus // 2 or 1))
-                pairhmm_threads = max(1, min(2, max_cpus // max_workers))
-                java_memory = format_java_memory(context["manifest"]["runtime"]["max_memory"])
                 shards = select_prs_shards(context, pathlib.Path(union_stage["artifacts"]["targets_vcf"]))
+                worker_plan = plan_worker_pool(
+                    stage_name="prs_dense_genotypes",
+                    shard_count=len(shards),
+                    max_cpus=int(context["manifest"]["runtime"]["max_cpus"]),
+                    max_memory=context["manifest"]["runtime"]["max_memory"],
+                    requested_workers=cfg.get("workers"),
+                    requested_pairhmm_threads=cfg.get("pairhmm_threads"),
+                    default_worker_cap=4,
+                    default_pairhmm_cap=2,
+                    min_memory_per_worker_gb=2.5,
+                    free_gb=context["disk"].get("free_gb"),
+                    min_free_gb=context["disk"].get("min_free_gb"),
+                )
 
                 tasks = [
                     (
@@ -670,13 +670,13 @@ def main() -> None:
                             shard=shard,
                             targets_vcf=pathlib.Path(union_stage["artifacts"]["targets_vcf"]),
                             sample_id=context["sample_id"],
-                            pairhmm_threads=pairhmm_threads,
-                            java_memory=java_memory,
+                            pairhmm_threads=worker_plan["pairhmm_threads"],
+                            java_memory=worker_plan["java_memory"],
                         )
                     )
                     for shard in shards
                 ]
-                dense_shards = run_tasks_in_parallel(tasks, max_workers=max_workers)
+                dense_shards = run_tasks_in_parallel(tasks, max_workers=worker_plan["workers"])
                 dense_vcf_path = concat_dense_vcf(dense_root, reference_fasta, context["sample_id"], dense_shards)
                 dense_info = stage_payload(
                     "prs_dense_genotypes",
@@ -684,6 +684,7 @@ def main() -> None:
                     reused=False,
                     score_hash=score_hash,
                     summary=union_stage.get("summary"),
+                    worker_plan=worker_plan,
                     artifacts={
                         "dense_vcf": dense_vcf_path,
                         "dense_vcf_index": dense_vcf_path + ".tbi",

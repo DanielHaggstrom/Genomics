@@ -15,8 +15,8 @@ from workflow.core.runtime import (
     complete_artifact,
     ensure_dir,
     ensure_docker_ready,
-    format_java_memory,
     load_json,
+    plan_worker_pool,
     read_text_if_exists,
     remove_if_exists,
     run_command,
@@ -865,11 +865,20 @@ def main() -> None:
                 sample_id = context["sample_id"]
                 cram_path = pathlib.Path(context["inputs"]["active"]["cram"])
                 reference_fasta = pathlib.Path(reference_stage["fasta"])
-                max_cpus = max(int(context["manifest"]["runtime"]["max_cpus"]), 1)
-                max_workers = max(1, min(2, max_cpus // 2 or 1))
-                pairhmm_threads = max(1, min(2, max_cpus // max_workers))
-                java_memory = format_java_memory(context["manifest"]["runtime"]["max_memory"])
                 shards = context["shards"]["monogenic"]
+                worker_plan = plan_worker_pool(
+                    stage_name="monogenic",
+                    shard_count=len(shards),
+                    max_cpus=int(context["manifest"]["runtime"]["max_cpus"]),
+                    max_memory=context["manifest"]["runtime"]["max_memory"],
+                    requested_workers=cfg.get("workers"),
+                    requested_pairhmm_threads=cfg.get("pairhmm_threads"),
+                    default_worker_cap=4,
+                    default_pairhmm_cap=2,
+                    min_memory_per_worker_gb=3.0,
+                    free_gb=context["disk"].get("free_gb"),
+                    min_free_gb=context["disk"].get("min_free_gb"),
+                )
 
                 tasks = [
                     (
@@ -880,16 +889,18 @@ def main() -> None:
                             reference_fasta=reference_fasta,
                             shard=shard,
                             sample_id=sample_id,
-                            pairhmm_threads=pairhmm_threads,
-                            java_memory=java_memory,
+                            pairhmm_threads=worker_plan["pairhmm_threads"],
+                            java_memory=worker_plan["java_memory"],
                         )
                     )
                     for shard in shards
                 ]
-                shard_vcfs = run_tasks_in_parallel(tasks, max_workers=max_workers)
+                shard_vcfs = run_tasks_in_parallel(tasks, max_workers=worker_plan["workers"])
                 _, filtered_vcf_path = concat_and_filter_monogenic(stage_root, reference_fasta, sample_id, shard_vcfs, docker_bin)
                 filtered_vcf = pathlib.Path(filtered_vcf_path)
                 source_mode = "called_from_cram"
+            if not called_vcf:
+                import_details = None
 
             annotated_vcf = stage_root / f"{context['sample_id']}.vep.clinvar_enriched.vcf.gz"
             vep_root = ensure_vep_resources(pathlib.Path(context["runtime"]["tool_cache_root"]))
@@ -918,6 +929,7 @@ def main() -> None:
             reused=False,
             source_mode=source_mode,
             import_details=import_details,
+            worker_plan=worker_plan if not called_vcf and not annotated_vcf_import else None,
             summary=summary,
             artifacts={
                 "annotated_vcf": str(annotated_vcf),
