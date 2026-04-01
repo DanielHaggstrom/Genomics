@@ -180,5 +180,7 @@ Concrete next steps:
 - Done: PRS now builds a dense genotype VCF from CRAM before scoring.
 - Done: monogenic now completes end-to-end from the CRAM-first path on the real sample.
 - Done: PRS compatibility export now builds a sex-aware PLINK pfile from the dense PRS VCF.
-- In progress: PRS direct-from-WGS harmonization; scoring still fails the configured overlap threshold.
-- Next likely improvement: improve harmonization (`hm_inferOtherAllele`, awkward/multiallelic rows) before considering imputation.
+- Done: PRS union-site building now supports `hm_inferOtherAllele` fallback and keeps valid multiallelic score rows instead of discarding them outright.
+- Done: PRS dense-genotype cache lineage now changes when harmonization logic changes, so improved targeting is not masked by stale cached artifacts.
+- In progress: PRS direct-from-WGS harmonization; scoring still fails the configured overlap threshold in the last measured run.
+- Next likely improvement: compare overlap after the harmonization change, then decide whether any additional direct-WGS cleanup is still worthwhile before considering imputation.
