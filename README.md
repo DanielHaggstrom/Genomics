@@ -64,6 +64,8 @@ Those imports do not create alternate execution graphs. They only skip the stage
 - `main.nf`: the pipeline graph
 - `nextflow.config`: Nextflow runtime settings
 - `run.sh`: the only user-facing shell entrypoint
+- `AGENTS.md`: shared repo instructions for Codex/agents
+- `PLANS.md`: shared execution roadmap for larger work
 - `manifests/`: tracked examples plus schema; private manifests live under ignored `manifests/local/`
 - `workflow/core/`: manifest, runtime, and reference/context logic
 - `workflow/stages/`: monogenic and PRS stage implementations
@@ -72,6 +74,8 @@ Those imports do not create alternate execution graphs. They only skip the stage
 - `output/results/`: final run outputs only
 
 The heavy runtime/cache state lives under `runtime.linux_cache_root`, not in the repo.
+
+`AGENTS.md` and `PLANS.md` are meant to be tracked. They document shared project guidance and the current narrow roadmap. Personal manifests, private presets, raw data, and generated outputs should remain untracked.
 
 ## Manifest
 
@@ -86,12 +90,15 @@ Main fields:
 - `reference.bundle_id`
 - `analysis.monogenic`
 - `analysis.prs`
+- `analysis.prs.sample_sex`
 - `runtime.linux_cache_root`
 - `outputs.results_dir`
 
 PRS score lists can come from either:
 - `analysis.prs.score_preset`
 - `analysis.prs.pgs_ids`
+
+If `analysis.prs.sample_sex` is set to `male` or `female`, the PRS compatibility step keeps sex chromosomes and writes a one-sample `.psam` for downstream tools. If it is omitted, PRS compatibility falls back to autosomes only.
 
 Tracked example presets live in:
 - `manifests/examples/score_presets.yaml`
