@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from workflow.stages.prs import parse_overlap_diagnostics, plink_sex_code, safe_sampleset_name
+from workflow.stages.prs import (
+    parse_base_tokens,
+    parse_overlap_diagnostics,
+    plink_sex_code,
+    resolve_score_row_alleles,
+    safe_sampleset_name,
+)
 
 
 class PrsHelperTests(unittest.TestCase):
@@ -26,6 +32,64 @@ class PrsHelperTests(unittest.TestCase):
         self.assertEqual(plink_sex_code("male"), "M")
         self.assertEqual(plink_sex_code("female"), "F")
         self.assertIsNone(plink_sex_code(None))
+
+    def test_parse_base_tokens_accepts_single_base_tokens_only(self) -> None:
+        self.assertEqual(parse_base_tokens("G/T"), {"G", "T"})
+        self.assertEqual(parse_base_tokens(" C / G / T "), {"C", "G", "T"})
+        self.assertEqual(parse_base_tokens("NA"), set())
+        self.assertEqual(parse_base_tokens("<DEL>"), set())
+
+    def test_resolve_score_row_alleles_prefers_explicit_other_allele(self) -> None:
+        resolved, reason = resolve_score_row_alleles(
+            {
+                "effect_allele": "A",
+                "other_allele": "G",
+                "hm_inferOtherAllele": "C/T",
+            },
+            "G",
+        )
+        self.assertIsNone(reason)
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved["source"], "explicit_other_allele")
+        self.assertEqual(resolved["alts"], ["A"])
+        self.assertFalse(resolved["multiallelic"])
+
+    def test_resolve_score_row_alleles_uses_hm_infer_other_allele(self) -> None:
+        resolved, reason = resolve_score_row_alleles(
+            {
+                "effect_allele": "A",
+                "hm_inferOtherAllele": "G/T",
+            },
+            "G",
+        )
+        self.assertIsNone(reason)
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(resolved["source"], "hm_inferOtherAllele")
+        self.assertEqual(resolved["alts"], ["A", "T"])
+        self.assertTrue(resolved["multiallelic"])
+
+    def test_resolve_score_row_alleles_reports_missing_other_allele(self) -> None:
+        resolved, reason = resolve_score_row_alleles(
+            {
+                "effect_allele": "A",
+            },
+            "A",
+        )
+        self.assertIsNone(resolved)
+        self.assertEqual(reason, "missing_other_allele")
+
+    def test_resolve_score_row_alleles_reports_reference_mismatch(self) -> None:
+        resolved, reason = resolve_score_row_alleles(
+            {
+                "effect_allele": "A",
+                "hm_inferOtherAllele": "G/T",
+            },
+            "C",
+        )
+        self.assertIsNone(resolved)
+        self.assertEqual(reason, "reference_not_in_score_alleles")
 
 
 if __name__ == "__main__":

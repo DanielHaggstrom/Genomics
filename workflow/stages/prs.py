@@ -27,7 +27,8 @@ from workflow.core.runtime import (
 )
 
 
-STAGE_VERSION = 5
+STAGE_VERSION = 6
+UNION_SITE_VERSION = 2
 GATK_IMAGE = "broadinstitute/gatk:4.6.1.0"
 PLINK2_IMAGE = "ghcr.io/pgscatalog/plink2:2.00a5.10"
 OVERLAP_RE = re.compile(r"Score (\S+) fails minimum matching threshold \(([\d.]+)% variants match\)")
@@ -99,6 +100,49 @@ def normalize_contig(raw: str, prefix: str) -> str:
     return raw
 
 
+def parse_base_tokens(raw: str | None) -> set[str]:
+    if not raw:
+        return set()
+    tokens = re.split(r"[\s,;/|]+", str(raw).upper().strip())
+    return {token for token in tokens if token in {"A", "C", "G", "T"}}
+
+
+def resolve_score_row_alleles(row: dict[str, str], ref: str) -> tuple[dict[str, Any] | None, str | None]:
+    effect_alleles = parse_base_tokens(row.get("effect_allele"))
+    if len(effect_alleles) != 1:
+        return None, "unsupported_effect_allele"
+
+    explicit_other = parse_base_tokens(row.get("other_allele"))
+    if explicit_other:
+        source = "explicit_other_allele"
+        other_alleles = explicit_other
+    else:
+        inferred_other = parse_base_tokens(row.get("hm_inferOtherAllele"))
+        if inferred_other:
+            source = "hm_inferOtherAllele"
+            other_alleles = inferred_other
+        else:
+            return None, "missing_other_allele"
+
+    effect = next(iter(effect_alleles))
+    all_alleles = set(other_alleles)
+    all_alleles.add(effect)
+    if ref not in all_alleles:
+        return None, "reference_not_in_score_alleles"
+
+    alts = all_alleles - {ref}
+    if not alts:
+        return None, "no_alt_after_reference_match"
+
+    return {
+        "source": source,
+        "effect_allele": effect,
+        "other_alleles": sorted(other_alleles),
+        "alts": sorted(alts),
+        "multiallelic": len(alts) > 1,
+    }, None
+
+
 def fetch_scorefile_url(pgs_id: str) -> str:
     with urllib.request.urlopen(f"https://www.pgscatalog.org/rest/score/{pgs_id}", timeout=60) as response:
         payload = json.load(response)
@@ -114,10 +158,11 @@ def build_union_sites(
 ) -> dict[str, Any]:
     pgs_ids = context["manifest"]["analysis"]["prs"]["pgs_ids"]
     prefix = context["contig_prefix"]
-    score_hash = hash_strings(pgs_ids)[:16]
+    score_hash = hash_strings([f"union-v{UNION_SITE_VERSION}", *pgs_ids])[:16]
     targets_root = ensure_dir(stage_root / score_hash / "targets")
     union_manifest_path = targets_root / "union_manifest.json"
     reuse_key = {
+        "union_site_version": UNION_SITE_VERSION,
         "pgs_ids": pgs_ids,
         "reference_bundle_id": context["reference_bundle"].get("bundle_id"),
         "reference_fasta": str(reference_fasta),
@@ -134,7 +179,13 @@ def build_union_sites(
     contig_order = {contig: idx for idx, contig in enumerate(fasta.index.keys())}
     site_map: dict[tuple[str, int], dict[str, object]] = {}
     per_score_counts: dict[str, int] = {}
+    accepted_rows_by_source = {
+        "explicit_other_allele": 0,
+        "hm_inferOtherAllele": 0,
+    }
+    multiallelic_rows = 0
     skipped = 0
+    skipped_reasons: dict[str, int] = {}
 
     for pgs_id in pgs_ids:
         url = fetch_scorefile_url(pgs_id)
@@ -157,13 +208,9 @@ def build_union_sites(
             for row in reader:
                 chrom_raw = row.get("hm_chr") or row.get("chr_name")
                 pos_raw = row.get("hm_pos") or row.get("chr_position")
-                effect = (row.get("effect_allele") or "").upper()
-                other = (row.get("other_allele") or "").upper()
                 if not chrom_raw or not pos_raw:
                     skipped += 1
-                    continue
-                if len(effect) != 1 or len(other) != 1 or effect not in {"A", "C", "G", "T"} or other not in {"A", "C", "G", "T"}:
-                    skipped += 1
+                    skipped_reasons["missing_position"] = skipped_reasons.get("missing_position", 0) + 1
                     continue
 
                 chrom = normalize_contig(chrom_raw, prefix)
@@ -172,21 +219,23 @@ def build_union_sites(
                     ref = fasta.get_base(chrom, pos)
                 except Exception:
                     skipped += 1
+                    skipped_reasons["reference_lookup_failed"] = skipped_reasons.get("reference_lookup_failed", 0) + 1
                     continue
-                alleles = {effect, other}
-                if ref not in alleles:
+
+                resolved, reason = resolve_score_row_alleles(row, ref)
+                if resolved is None:
                     skipped += 1
-                    continue
-                alts = alleles - {ref}
-                if not alts:
-                    skipped += 1
+                    skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
                     continue
 
                 key = (chrom, pos)
                 entry = site_map.setdefault(key, {"ref": ref, "alts": set(), "pgs_ids": set()})
-                entry["alts"].update(alts)
+                entry["alts"].update(resolved["alts"])
                 entry["pgs_ids"].add(pgs_id)
                 per_score_counts[pgs_id] += 1
+                accepted_rows_by_source[resolved["source"]] = accepted_rows_by_source.get(resolved["source"], 0) + 1
+                if resolved["multiallelic"]:
+                    multiallelic_rows += 1
 
     plain_vcf = targets_root / "pgs_union_sites.vcf"
     with open(plain_vcf, "w", encoding="utf-8") as out:
@@ -213,7 +262,10 @@ def build_union_sites(
         "summary": {
             "union_sites": len(site_map),
             "skipped_rows": skipped,
+            "skipped_reasons": skipped_reasons,
             "per_score_counts": per_score_counts,
+            "accepted_rows_by_source": accepted_rows_by_source,
+            "accepted_multiallelic_rows": multiallelic_rows,
         },
         "artifacts": {
             "targets_vcf": str(targets_vcf),
