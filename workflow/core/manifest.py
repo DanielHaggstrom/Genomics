@@ -36,6 +36,7 @@ PRS_DEFAULTS = {
     "run_ancestry": False,
     "reference_db": None,
     "min_overlap": 0.75,
+    "sample_sex": None,
 }
 
 

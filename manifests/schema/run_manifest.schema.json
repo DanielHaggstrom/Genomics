@@ -150,6 +150,17 @@
                 "null"
               ]
             },
+            "sample_sex": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "male",
+                "female",
+                null
+              ]
+            },
             "min_overlap": {
               "type": "number",
               "minimum": 0.0,

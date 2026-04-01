@@ -19,6 +19,7 @@ from workflow.core.runtime import (
     format_java_memory,
     hash_strings,
     load_json,
+    remove_if_exists,
     run_command,
     run_tasks_in_parallel,
     stage_payload,
@@ -26,8 +27,9 @@ from workflow.core.runtime import (
 )
 
 
-STAGE_VERSION = 3
+STAGE_VERSION = 5
 GATK_IMAGE = "broadinstitute/gatk:4.6.1.0"
+PLINK2_IMAGE = "ghcr.io/pgscatalog/plink2:2.00a5.10"
 OVERLAP_RE = re.compile(r"Score (\S+) fails minimum matching threshold \(([\d.]+)% variants match\)")
 
 
@@ -73,6 +75,19 @@ def safe_sampleset_name(sample_id: str) -> str:
     if not out or out.lower() == "reference":
         return "sample"
     return out
+
+
+def plink_sex_code(sample_sex: str | None) -> str | None:
+    if not sample_sex:
+        return None
+    normalized = str(sample_sex).strip().lower()
+    mapping = {
+        "male": "M",
+        "female": "F",
+    }
+    if normalized not in mapping:
+        raise ValueError("analysis.prs.sample_sex must be 'male' or 'female'.")
+    return mapping[normalized]
 
 
 def normalize_contig(raw: str, prefix: str) -> str:
@@ -236,6 +251,7 @@ def build_dense_prs_shard(
     java_memory: str,
 ) -> str:
     shard_dir = ensure_dir(stage_root / "dense" / "shards" / shard["name"])
+    log_dir = ensure_dir(stage_root / "logs")
     shard_targets = shard_dir / f"{shard['name']}.targets.vcf.gz"
     gvcf = shard_dir / f"{sample_id}.{shard['name']}.g.vcf.gz"
     dense_vcf = shard_dir / f"{sample_id}.{shard['name']}.dense.vcf.gz"
@@ -243,8 +259,16 @@ def build_dense_prs_shard(
 
     if not complete_artifact(shard_targets):
         remove_if_exists(shard_targets, f"{shard_targets}.tbi")
-        run_command(["bcftools", "view", "-r", region_arg, "-Oz", "-o", str(shard_targets), str(targets_vcf)], check=True)
-        run_command(["tabix", "-f", "-p", "vcf", str(shard_targets)], check=True)
+        run_command(
+            ["bcftools", "view", "-r", region_arg, "-Oz", "-o", str(shard_targets), str(targets_vcf)],
+            check=True,
+            log_path=log_dir / f"{shard['name']}.targets.log",
+        )
+        run_command(
+            ["tabix", "-f", "-p", "vcf", str(shard_targets)],
+            check=True,
+            log_path=log_dir / f"{shard['name']}.targets.index.log",
+        )
 
     if not complete_artifact(gvcf):
         remove_if_exists(gvcf, f"{gvcf}.tbi")
@@ -258,7 +282,8 @@ def build_dense_prs_shard(
                 },
                 inner_args=[
                     "gatk",
-                    f"--java-options=-Xmx{java_memory}",
+                    "--java-options",
+                    f"-Xmx{java_memory}",
                     "HaplotypeCaller",
                     "-R", f"/ref/{reference_fasta.name}",
                     "-I", f"/input/{cram_path.name}",
@@ -270,6 +295,7 @@ def build_dense_prs_shard(
                 docker_bin=docker_bin,
             ),
             check=True,
+            log_path=log_dir / f"{shard['name']}.haplotypecaller.log",
         )
 
     if not complete_artifact(dense_vcf):
@@ -284,7 +310,8 @@ def build_dense_prs_shard(
                 },
                 inner_args=[
                     "gatk",
-                    f"--java-options=-Xmx{java_memory}",
+                    "--java-options",
+                    f"-Xmx{java_memory}",
                     "GenotypeGVCFs",
                     "-R", f"/ref/{reference_fasta.name}",
                     "-V", f"/out/dense/shards/{shard['name']}/{gvcf.name}",
@@ -295,6 +322,7 @@ def build_dense_prs_shard(
                 docker_bin=docker_bin,
             ),
             check=True,
+            log_path=log_dir / f"{shard['name']}.genotypegvcfs.log",
         )
     return str(dense_vcf)
 
@@ -302,15 +330,134 @@ def build_dense_prs_shard(
 def concat_dense_vcf(stage_root: pathlib.Path, reference_fasta: pathlib.Path, sample_id: str, dense_shards: list[str]) -> str:
     concat_vcf = stage_root / "dense" / f"{sample_id}.prs_dense.concat.vcf.gz"
     final_vcf = stage_root / "dense" / f"{sample_id}.prs_dense.vcf.gz"
+    log_dir = ensure_dir(stage_root / "logs")
     if not complete_artifact(concat_vcf):
         remove_if_exists(concat_vcf, f"{concat_vcf}.tbi")
-        run_command(["bcftools", "concat", "-a", "-Oz", "-o", str(concat_vcf), *dense_shards], check=True)
-        run_command(["tabix", "-f", "-p", "vcf", str(concat_vcf)], check=True)
+        run_command(
+            ["bcftools", "concat", "-a", "-Oz", "-o", str(concat_vcf), *dense_shards],
+            check=True,
+            log_path=log_dir / "dense.concat.log",
+        )
+        run_command(
+            ["tabix", "-f", "-p", "vcf", str(concat_vcf)],
+            check=True,
+            log_path=log_dir / "dense.concat.index.log",
+        )
     if not complete_artifact(final_vcf):
         remove_if_exists(final_vcf, f"{final_vcf}.tbi")
-        run_command(["bcftools", "norm", "-f", str(reference_fasta), "-m", "-both", "-Oz", "-o", str(final_vcf), str(concat_vcf)], check=True)
-        run_command(["tabix", "-f", "-p", "vcf", str(final_vcf)], check=True)
+        run_command(
+            ["bcftools", "norm", "-f", str(reference_fasta), "-m", "-both", "-Oz", "-o", str(final_vcf), str(concat_vcf)],
+            check=True,
+            log_path=log_dir / "dense.norm.log",
+        )
+        run_command(
+            ["tabix", "-f", "-p", "vcf", str(final_vcf)],
+            check=True,
+            log_path=log_dir / "dense.norm.index.log",
+        )
     return str(final_vcf)
+
+
+def complete_pfile(prefix: pathlib.Path) -> bool:
+    return artifacts_exist(
+        [
+            str(prefix) + ".pgen",
+            str(prefix) + ".psam",
+            str(prefix) + ".pvar.zst",
+        ]
+    )
+
+
+def build_pgsc_input_pfile(
+    *,
+    context: dict[str, Any],
+    stage_root: pathlib.Path,
+    dense_vcf: pathlib.Path,
+) -> dict[str, Any]:
+    docker_bin = context["host_checks"]["docker"] or "docker"
+    ensure_docker_ready(docker_bin)
+
+    prep_root = ensure_dir(stage_root / "compatible")
+    sampleset = safe_sampleset_name(context["sample_id"])
+    output_prefix = prep_root / f"GRCh38_{sampleset}_ALL"
+    sex_code = plink_sex_code(context["manifest"]["analysis"]["prs"].get("sample_sex"))
+    chrom_filter = "1-22, X, Y, XY" if sex_code else "1-22"
+    max_cpus = max(int(context["manifest"]["runtime"]["max_cpus"]), 1)
+    thread_count = max(1, min(4, max_cpus // 2 or 1))
+    memory_raw = context["manifest"]["runtime"]["max_memory"].lower().replace(" ", "")
+    if memory_raw.endswith(".gb"):
+        memory_mb = int(float(memory_raw[:-3]) * 1024)
+    elif memory_raw.endswith("gb"):
+        memory_mb = int(float(memory_raw[:-2]) * 1024)
+    elif memory_raw.endswith(".mb"):
+        memory_mb = int(float(memory_raw[:-3]))
+    elif memory_raw.endswith("mb"):
+        memory_mb = int(float(memory_raw[:-2]))
+    else:
+        memory_mb = int(float(memory_raw.rstrip("gm")))
+    log_path = prep_root / "plink2.make_pfile.log"
+
+    if not complete_pfile(output_prefix):
+        remove_if_exists(
+            str(output_prefix) + ".pgen",
+            str(output_prefix) + ".psam",
+            str(output_prefix) + ".pvar.zst",
+            str(output_prefix) + ".pvar",
+            str(output_prefix) + ".log",
+        )
+
+        sex_file = prep_root / "sample_sex.tsv"
+        args = [
+            "plink2",
+            "--threads", str(thread_count),
+            "--memory", str(memory_mb),
+            "--set-all-var-ids", "@:#:$r:$a",
+            "--new-id-max-allele-len", "256",
+            "--max-alleles", "2",
+        ]
+        if sex_code:
+            sex_file.write_text(
+                "#FID\tIID\tSEX\n"
+                f"0\t{context['sample_id']}\t{sex_code}\n",
+                encoding="utf-8",
+            )
+            args.extend(["--update-sex", f"/work/{sex_file.name}"])
+
+        args.extend(
+            [
+                "--vcf", f"/input/{dense_vcf.name}",
+                "--allow-extra-chr",
+                "--chr", chrom_filter,
+                "--make-pgen", "vzs", "pvar-cols=-xheader,-maybequal,-maybefilter,-maybeinfo,-maybecm",
+                "--out", f"/work/{output_prefix.name}",
+            ]
+        )
+
+        run_command(
+            build_docker_run_command(
+                image=PLINK2_IMAGE,
+                mounts={
+                    dense_vcf.parent: "/input",
+                    prep_root: "/work",
+                },
+                inner_args=args,
+                docker_bin=docker_bin,
+            ),
+            check=True,
+            log_path=log_path,
+        )
+
+    return {
+        "path_prefix": str(output_prefix),
+        "sample_sex": context["manifest"]["analysis"]["prs"].get("sample_sex"),
+        "sex_chromosomes_included": bool(sex_code),
+        "artifacts": {
+            "pgen": str(output_prefix) + ".pgen",
+            "psam": str(output_prefix) + ".psam",
+            "pvar": str(output_prefix) + ".pvar.zst",
+            "log": str(log_path),
+        },
+    }
 
 
 def run_pgsc_calc(
@@ -318,7 +465,7 @@ def run_pgsc_calc(
     context: dict[str, Any],
     stage_root: pathlib.Path,
     dense_vcf: pathlib.Path,
-) -> tuple[int, pathlib.Path]:
+) -> tuple[int, pathlib.Path, dict[str, Any]]:
     ids = context["manifest"]["analysis"]["prs"]["pgs_ids"]
     samplesheet = stage_root / "samplesheet.csv"
     ids_file = stage_root / "pgs_ids.txt"
@@ -326,10 +473,11 @@ def run_pgsc_calc(
     workdir = ensure_dir(stage_root / "work")
     genotypes_cache = ensure_dir(stage_root / "genotypes_cache")
     log_path = stage_root / "pgsc_calc.log"
+    pfile_info = build_pgsc_input_pfile(context=context, stage_root=stage_root, dense_vcf=dense_vcf)
 
     samplesheet.write_text(
-        "sampleset,path_prefix,chrom,format,vcf_genotype_field\n"
-        f"{safe_sampleset_name(context['sample_id'])},{str(dense_vcf)[:-7]},,vcf,GT\n",
+        "sampleset,path_prefix,chrom,format\n"
+        f"{safe_sampleset_name(context['sample_id'])},{pfile_info['path_prefix']},,pfile\n",
         encoding="utf-8",
     )
     ids_file.write_text("\n".join(ids) + "\n", encoding="utf-8")
@@ -354,7 +502,7 @@ def run_pgsc_calc(
         "NXF_HOME": context["runtime"]["nextflow_home"],
     }
     completed = run_command(args, cwd=context["repo_root"], env=env, log_path=log_path, check=False)
-    return completed.returncode, log_path
+    return completed.returncode, log_path, pfile_info
 
 
 def find_first(root: pathlib.Path, pattern: str) -> str | None:
@@ -384,6 +532,9 @@ def main() -> None:
     context = load_json(args.context)
     cfg = context["manifest"]["analysis"]["prs"]
     stage_root = ensure_dir(pathlib.Path(context["cache"]["prs_root"]))
+    stage_manifest_path = stage_root / "stage_manifest.json"
+    scoring_root = stage_root / "scoring"
+    cache_key = f"v{STAGE_VERSION}:{context['input_fingerprint']['id']}:initializing"
 
     try:
         if not cfg["enabled"]:
@@ -498,6 +649,7 @@ def main() -> None:
                 score_hash,
                 str(cfg["min_overlap"]),
                 str(bool(imported_dense)),
+                str(cfg.get("sample_sex") or "autosome_only"),
             ]
         )
         reused = load_existing_stage(stage_manifest_path, cache_key)
@@ -505,7 +657,7 @@ def main() -> None:
             write_json(args.output, reused)
             return
 
-        exit_code, log_path = run_pgsc_calc(context=context, stage_root=scoring_root, dense_vcf=pathlib.Path(dense_info["artifacts"]["dense_vcf"]))
+        exit_code, log_path, pfile_info = run_pgsc_calc(context=context, stage_root=scoring_root, dense_vcf=pathlib.Path(dense_info["artifacts"]["dense_vcf"]))
         log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
         aggregated_scores = find_first(scoring_root / "pgsc_calc", "aggregated_scores.txt.gz")
         report_html = find_first(scoring_root / "pgsc_calc", "report.html")
@@ -524,12 +676,18 @@ def main() -> None:
                     "exit_code": exit_code,
                     "overlap_failures": overlap_failures,
                     "log_path": str(log_path),
+                    "sample_sex": pfile_info["sample_sex"],
+                    "sex_chromosomes_included": pfile_info["sex_chromosomes_included"],
                 },
                 artifacts={
                     "dense_vcf": dense_info["artifacts"]["dense_vcf"],
                     "dense_vcf_index": dense_info["artifacts"]["dense_vcf_index"],
                     "targets_vcf": dense_info["artifacts"].get("targets_vcf"),
                     "targets_vcf_index": dense_info["artifacts"].get("targets_vcf_index"),
+                    "compatible_pgen": pfile_info["artifacts"]["pgen"],
+                    "compatible_psam": pfile_info["artifacts"]["psam"],
+                    "compatible_pvar": pfile_info["artifacts"]["pvar"],
+                    "compatible_plink_log": pfile_info["artifacts"]["log"],
                     "pgsc_outdir": str(scoring_root / "pgsc_calc"),
                     "pgsc_log": str(log_path),
                 },
@@ -558,12 +716,18 @@ def main() -> None:
                 "union_sites": (dense_info.get("summary") or {}).get("union_sites"),
                 "preview_rows": preview_rows,
                 "overlap_failures": overlap_failures,
+                "sample_sex": pfile_info["sample_sex"],
+                "sex_chromosomes_included": pfile_info["sex_chromosomes_included"],
             },
             artifacts={
                 "dense_vcf": dense_info["artifacts"]["dense_vcf"],
                 "dense_vcf_index": dense_info["artifacts"]["dense_vcf_index"],
                 "targets_vcf": dense_info["artifacts"].get("targets_vcf"),
                 "targets_vcf_index": dense_info["artifacts"].get("targets_vcf_index"),
+                "compatible_pgen": pfile_info["artifacts"]["pgen"],
+                "compatible_psam": pfile_info["artifacts"]["psam"],
+                "compatible_pvar": pfile_info["artifacts"]["pvar"],
+                "compatible_plink_log": pfile_info["artifacts"]["log"],
                 "aggregated_scores": aggregated_scores,
                 "pgsc_report_html": report_html,
                 "match_summary": match_summary,
@@ -577,8 +741,10 @@ def main() -> None:
         payload = stage_payload(
             "prs",
             "failed",
+            cache_key=cache_key,
             input_fingerprint_id=context["input_fingerprint"]["id"],
             message=str(exc),
+            artifacts={"log_dir": str(scoring_root / "logs")},
         )
         write_json(stage_manifest_path, payload)
         write_json(args.output, payload)

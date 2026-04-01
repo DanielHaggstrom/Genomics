@@ -503,6 +503,7 @@ def call_monogenic_shard(
     java_memory: str,
 ) -> str:
     shard_dir = ensure_dir(stage_root / "shards" / shard["name"])
+    log_dir = ensure_dir(stage_root / "logs")
     gvcf = shard_dir / f"{sample_id}.{shard['name']}.g.vcf.gz"
     raw_vcf = shard_dir / f"{sample_id}.{shard['name']}.raw.vcf.gz"
     interval_args = [item for interval in shard["intervals"] for item in ("-L", interval)]
@@ -518,7 +519,8 @@ def call_monogenic_shard(
                 image=GATK_IMAGE,
                 inner_args=[
                     "gatk",
-                    f"--java-options=-Xmx{java_memory}",
+                    "--java-options",
+                    f"-Xmx{java_memory}",
                     "HaplotypeCaller",
                     "-R", f"/ref/{reference_fasta.name}",
                     "-I", f"/input/{cram_path.name}",
@@ -529,6 +531,7 @@ def call_monogenic_shard(
                 ],
             ),
             check=True,
+            log_path=log_dir / f"{shard['name']}.haplotypecaller.log",
         )
 
     if not complete_artifact(raw_vcf):
@@ -542,7 +545,8 @@ def call_monogenic_shard(
                 image=GATK_IMAGE,
                 inner_args=[
                     "gatk",
-                    f"--java-options=-Xmx{java_memory}",
+                    "--java-options",
+                    f"-Xmx{java_memory}",
                     "GenotypeGVCFs",
                     "-R", f"/ref/{reference_fasta.name}",
                     "-V", f"/out/shards/{shard['name']}/{gvcf.name}",
@@ -551,6 +555,7 @@ def call_monogenic_shard(
                 ],
             ),
             check=True,
+            log_path=log_dir / f"{shard['name']}.genotypegvcfs.log",
         )
 
     return str(raw_vcf)
@@ -562,11 +567,20 @@ def concat_and_filter_monogenic(stage_root: pathlib.Path, reference_fasta: pathl
     tmp_snp = stage_root / f"{sample_id}.snps.filtered.vcf.gz"
     tmp_indel = stage_root / f"{sample_id}.indels.filtered.vcf.gz"
     java_memory = "4g"
+    log_dir = ensure_dir(stage_root / "logs")
 
     if not complete_artifact(raw_vcf):
         remove_if_exists(raw_vcf, f"{raw_vcf}.tbi")
-        run_command(["bcftools", "concat", "-a", "-Oz", "-o", str(raw_vcf), *shard_vcfs], check=True)
-        run_command(["tabix", "-f", "-p", "vcf", str(raw_vcf)], check=True)
+        run_command(
+            ["bcftools", "concat", "-a", "-Oz", "-o", str(raw_vcf), *shard_vcfs],
+            check=True,
+            log_path=log_dir / "raw.concat.log",
+        )
+        run_command(
+            ["tabix", "-f", "-p", "vcf", str(raw_vcf)],
+            check=True,
+            log_path=log_dir / "raw.concat.index.log",
+        )
 
     if not complete_artifact(tmp_snp):
         remove_if_exists(stage_root / f"{sample_id}.snps.vcf.gz", stage_root / f"{sample_id}.snps.vcf.gz.tbi", tmp_snp, f"{tmp_snp}.tbi")
@@ -576,7 +590,8 @@ def concat_and_filter_monogenic(stage_root: pathlib.Path, reference_fasta: pathl
                 mounts={reference_fasta.parent: "/ref", stage_root: "/out"},
                 inner_args=[
                     "gatk",
-                    f"--java-options=-Xmx{java_memory}",
+                    "--java-options",
+                    f"-Xmx{java_memory}",
                     "SelectVariants",
                     "-R", f"/ref/{reference_fasta.name}",
                     "-V", f"/out/{raw_vcf.name}",
@@ -586,6 +601,7 @@ def concat_and_filter_monogenic(stage_root: pathlib.Path, reference_fasta: pathl
                 docker_bin=docker_bin,
             ),
             check=True,
+            log_path=log_dir / "select_snps.log",
         )
         run_command(
             build_docker_run_command(
@@ -593,7 +609,8 @@ def concat_and_filter_monogenic(stage_root: pathlib.Path, reference_fasta: pathl
                 mounts={reference_fasta.parent: "/ref", stage_root: "/out"},
                 inner_args=[
                     "gatk",
-                    f"--java-options=-Xmx{java_memory}",
+                    "--java-options",
+                    f"-Xmx{java_memory}",
                     "VariantFiltration",
                     "-R", f"/ref/{reference_fasta.name}",
                     "-V", f"/out/{sample_id}.snps.vcf.gz",
@@ -604,6 +621,7 @@ def concat_and_filter_monogenic(stage_root: pathlib.Path, reference_fasta: pathl
                 docker_bin=docker_bin,
             ),
             check=True,
+            log_path=log_dir / "filter_snps.log",
         )
 
     if not complete_artifact(tmp_indel):
@@ -614,7 +632,8 @@ def concat_and_filter_monogenic(stage_root: pathlib.Path, reference_fasta: pathl
                 mounts={reference_fasta.parent: "/ref", stage_root: "/out"},
                 inner_args=[
                     "gatk",
-                    f"--java-options=-Xmx{java_memory}",
+                    "--java-options",
+                    f"-Xmx{java_memory}",
                     "SelectVariants",
                     "-R", f"/ref/{reference_fasta.name}",
                     "-V", f"/out/{raw_vcf.name}",
@@ -624,6 +643,7 @@ def concat_and_filter_monogenic(stage_root: pathlib.Path, reference_fasta: pathl
                 docker_bin=docker_bin,
             ),
             check=True,
+            log_path=log_dir / "select_indels.log",
         )
         run_command(
             build_docker_run_command(
@@ -631,7 +651,8 @@ def concat_and_filter_monogenic(stage_root: pathlib.Path, reference_fasta: pathl
                 mounts={reference_fasta.parent: "/ref", stage_root: "/out"},
                 inner_args=[
                     "gatk",
-                    f"--java-options=-Xmx{java_memory}",
+                    "--java-options",
+                    f"-Xmx{java_memory}",
                     "VariantFiltration",
                     "-R", f"/ref/{reference_fasta.name}",
                     "-V", f"/out/{sample_id}.indels.vcf.gz",
@@ -642,12 +663,21 @@ def concat_and_filter_monogenic(stage_root: pathlib.Path, reference_fasta: pathl
                 docker_bin=docker_bin,
             ),
             check=True,
+            log_path=log_dir / "filter_indels.log",
         )
 
     if not complete_artifact(filtered_vcf):
         remove_if_exists(filtered_vcf, f"{filtered_vcf}.tbi")
-        run_command(["bcftools", "concat", "-a", "-Oz", "-o", str(filtered_vcf), str(tmp_snp), str(tmp_indel)], check=True)
-        run_command(["tabix", "-f", "-p", "vcf", str(filtered_vcf)], check=True)
+        run_command(
+            ["bcftools", "concat", "-a", "-Oz", "-o", str(filtered_vcf), str(tmp_snp), str(tmp_indel)],
+            check=True,
+            log_path=log_dir / "filtered.concat.log",
+        )
+        run_command(
+            ["tabix", "-f", "-p", "vcf", str(filtered_vcf)],
+            check=True,
+            log_path=log_dir / "filtered.concat.index.log",
+        )
 
     return str(raw_vcf), str(filtered_vcf)
 
@@ -692,12 +722,13 @@ def annotate_with_vep(
 
     output_vcf.parent.mkdir(parents=True, exist_ok=True)
     warning_path = output_vcf.parent / f"{output_vcf.name}_warnings.txt"
+    log_path = output_vcf.parent / "vep.annotate.log"
+    work_root = output_vcf.parent
     run_command(
         build_docker_run_command(
             image=VEP_IMAGE,
             mounts={
-                input_vcf.parent: "/input",
-                output_vcf.parent: "/output",
+                work_root: "/work",
                 vep_data_root: "/vep_data",
             },
             inner_args=[
@@ -707,9 +738,9 @@ def annotate_with_vep(
                 "--assembly", "GRCh38",
                 "--species", "homo_sapiens",
                 "--dir_cache", "/vep_data/cache",
-                "--input_file", f"/input/{input_vcf.name}",
-                "--output_file", f"/output/{output_vcf.name}",
-                "--warning_file", f"/output/{warning_path.name}",
+                "--input_file", f"/work/{input_vcf.name}",
+                "--output_file", f"/work/{output_vcf.name}",
+                "--warning_file", f"/work/{warning_path.name}",
                 "--format", "vcf",
                 "--vcf",
                 "--compress_output", "bgzip",
@@ -725,8 +756,9 @@ def annotate_with_vep(
             docker_bin=docker_bin,
         ),
         check=True,
+        log_path=log_path,
     )
-    run_command(["tabix", "-f", "-p", "vcf", str(output_vcf)], check=True)
+    run_command(["tabix", "-f", "-p", "vcf", str(output_vcf)], check=True, log_path=output_vcf.parent / "vep.index.log")
     return str(output_vcf)
 
 
@@ -905,6 +937,7 @@ def main() -> None:
             cache_key=cache_key,
             input_fingerprint_id=context["input_fingerprint"]["id"],
             message=str(exc),
+            artifacts={"log_dir": str(stage_root / "logs")},
         )
         write_json(stage_manifest_path, payload)
         write_json(args.output, payload)

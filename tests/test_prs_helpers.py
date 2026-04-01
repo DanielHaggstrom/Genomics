@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from workflow.stages.prs import parse_overlap_diagnostics, safe_sampleset_name
+from workflow.stages.prs import parse_overlap_diagnostics, plink_sex_code, safe_sampleset_name
 
 
 class PrsHelperTests(unittest.TestCase):
@@ -21,6 +21,11 @@ class PrsHelperTests(unittest.TestCase):
         self.assertEqual(len(parsed), 2)
         self.assertEqual(parsed[0]["score"], "PGS999001_hmPOS_GRCh38")
         self.assertEqual(parsed[0]["match_percent"], "37.95")
+
+    def test_plink_sex_code(self) -> None:
+        self.assertEqual(plink_sex_code("male"), "M")
+        self.assertEqual(plink_sex_code("female"), "F")
+        self.assertIsNone(plink_sex_code(None))
 
 
 if __name__ == "__main__":

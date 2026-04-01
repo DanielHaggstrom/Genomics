@@ -19,6 +19,7 @@ analysis:
   prs:
     enabled: true
     score_preset: demo
+    sample_sex: male
     run_ancestry: false
     reference_db: null
     min_overlap: 0.75
