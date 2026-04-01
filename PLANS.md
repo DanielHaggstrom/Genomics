@@ -182,5 +182,6 @@ Concrete next steps:
 - Done: PRS compatibility export now builds a sex-aware PLINK pfile from the dense PRS VCF.
 - Done: PRS union-site building now supports `hm_inferOtherAllele` fallback and keeps valid multiallelic score rows instead of discarding them outright.
 - Done: PRS dense-genotype cache lineage now changes when harmonization logic changes, so improved targeting is not masked by stale cached artifacts.
+- Done: execution mode is now explicit and derived as `monogenic-only`, `prs-only`, or `both`, with tracked example manifests and report output that adapts to the selected mode.
 - In progress: PRS direct-from-WGS harmonization; scoring still fails the configured overlap threshold in the last measured run.
 - Next likely improvement: compare overlap after the harmonization change, then decide whether any additional direct-WGS cleanup is still worthwhile before considering imputation.
