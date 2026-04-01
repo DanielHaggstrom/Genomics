@@ -44,17 +44,13 @@ Path of highest sanity:
 - improve progress visibility before adding new features
 
 Concrete next steps:
-- make monogenic worker count scale better with available CPU and memory
-- keep per-shard resource use bounded so the machine stays usable
 - expose clearer stage progress in logs or manifests
-- add a resource-aware worker planner instead of fixed low caps
-- make worker selection automatic from available CPU, RAM, and shard shape
 - define explicit operator commands for tuning and resuming runs
 - investigate safe live tuning during a run; if true live changes are not reliable, support a documented graceful stop-and-resume path that preserves completed shard work
 
 Operator-facing target behavior:
 - support automatic worker defaults derived from `runtime.max_cpus`, `runtime.max_memory`, current shard plan, and observed free disk headroom
-- keep manual override knobs narrow and explicit, ideally:
+- keep manual override knobs narrow and explicit:
   - `analysis.monogenic.workers`
   - `analysis.prs.workers`
   - `analysis.monogenic.pairhmm_threads`
@@ -74,6 +70,11 @@ Explicit non-goals for this phase:
 - no new workflow engine
 - no Kubernetes/cloud detour
 - no new UI
+
+Status:
+- automatic worker planning is now implemented for monogenic and PRS dense genotyping
+- narrow per-stage override knobs are now part of the manifest schema
+- live tuning during an active run is still future work
 
 ### 3. Harden cache and import behavior
 
@@ -158,6 +159,58 @@ Concrete next steps:
 - preserve technical TSV/VCF artifacts as machine-readable companions
 - improve wording only when it increases clarity, not length
 
+### 7. Streamline code without forcing clever abstractions
+
+Goal:
+- reduce accidental complexity and dead code without hiding real genomics complexity
+
+Current audit summary:
+- the repo is no longer carrying two pipelines
+- most remaining live code is concentrated where it should be:
+  - `workflow/stages/monogenic.py`
+  - `workflow/stages/prs.py`
+  - `workflow/core/reference.py`
+- the best remaining simplification opportunities are local refactors, not another architectural rewrite
+
+Ranked quick wins:
+- remove dead helpers that are no longer used:
+  - `workflow/stages/monogenic.py::parse_summary_file`
+  - `workflow/core/runtime.py::resolve_docker_bin`
+- trim obviously duplicated small stage helpers where a single shared helper is clearer than two copies
+- keep deleting vestigial code whenever a refactor makes a helper unnecessary
+
+Ranked worthwhile medium refactors:
+- unify annotated-VCF / CSQ walking in the monogenic stage
+  - today both priority extraction and ClinVar triage parse the same annotated VCF shape separately
+  - extract one shared iterator or row-normalization helper and keep the selection logic separate
+- split `workflow/core/reference.py::cmd_prepare_context` into a few clear helper steps
+  - input + disk/executable checks
+  - CRAM header / shard planning
+  - reference bundle resolution
+  - final context assembly
+- lightly deduplicate stage orchestration patterns shared by monogenic and PRS
+  - disabled-stage short circuit
+  - cache-hit reuse
+  - standard failure payload shape
+  - import provenance summary
+  - do this only if the shared helper is simpler than the duplicated code
+
+Areas to leave alone unless pain increases:
+- `workflow/reporting/report.py`
+  - manual Markdown is acceptable here; do not add a templating layer just to save lines
+- the split between `workflow/core`, `workflow/stages`, and `workflow/reporting`
+  - this is currently a sane boundary, not over-modularization
+- tracked example manifests
+  - the separate `both`, `monogenic-only`, and `prs-only` examples improve clarity more than they cost in lines
+- `runtime.py` as the boring utility bucket
+  - keep it consolidated unless a helper group clearly wants its own file
+
+Guardrails for this cleanup phase:
+- prefer fewer, clearer functions over more files
+- do not refactor just to reduce LoC on a graph
+- do not add abstractions that make stage behavior harder to follow
+- only keep refactors that make the pipeline easier to trust, test, or resume
+
 ## Things We Should Not Add Unless Scope Changes
 
 - clinical interpretation framework beyond research triage
@@ -183,5 +236,6 @@ Concrete next steps:
 - Done: PRS union-site building now supports `hm_inferOtherAllele` fallback and keeps valid multiallelic score rows instead of discarding them outright.
 - Done: PRS dense-genotype cache lineage now changes when harmonization logic changes, so improved targeting is not masked by stale cached artifacts.
 - Done: execution mode is now explicit and derived as `monogenic-only`, `prs-only`, or `both`, with tracked example manifests and report output that adapts to the selected mode.
+- Done: resource-aware worker planning is now implemented for monogenic and PRS dense-genotype stages, with optional narrow manifest overrides for workers and `pairhmm_threads`.
 - In progress: PRS direct-from-WGS harmonization; scoring still fails the configured overlap threshold in the last measured run.
-- Next likely improvement: compare overlap after the harmonization change, then decide whether any additional direct-WGS cleanup is still worthwhile before considering imputation.
+- Next likely improvement: expose clearer stage progress and a documented stop-adjust-resume path before deciding whether any true live tuning support is worth adding.
