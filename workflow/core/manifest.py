@@ -40,6 +40,18 @@ PRS_DEFAULTS = {
 }
 
 
+def derive_execution_mode(manifest: dict[str, Any]) -> str:
+    monogenic_enabled = bool(((manifest.get("analysis") or {}).get("monogenic") or {}).get("enabled"))
+    prs_enabled = bool(((manifest.get("analysis") or {}).get("prs") or {}).get("enabled"))
+    if monogenic_enabled and prs_enabled:
+        return "both"
+    if monogenic_enabled:
+        return "monogenic-only"
+    if prs_enabled:
+        return "prs-only"
+    raise SystemExit("At least one analysis stage must be enabled: monogenic, prs, or both.")
+
+
 def load_presets(manifest_path: pathlib.Path | None = None) -> dict[str, list[str]]:
     candidates = [REPO_ROOT / "manifests" / "examples" / "score_presets.yaml"]
     if manifest_path is not None:
@@ -116,6 +128,8 @@ def validate_manifest_file(manifest_path: pathlib.Path, schema_path: pathlib.Pat
     if errors:
         raise SystemExit("Manifest validation failed:\n- " + "\n- ".join(errors))
 
+    derive_execution_mode(manifest)
+
     return manifest
 
 
@@ -140,6 +154,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
         "manifest_path": str(manifest_path),
         "schema_path": str(schema_path),
         "manifest": manifest,
+        "execution_mode": derive_execution_mode(manifest),
     }
     write_json(args.output, payload)
     return 0

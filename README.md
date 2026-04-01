@@ -5,6 +5,11 @@ Single-sample, research-use genome analysis from `CRAM/CRAI` to:
 - dense PRS genotypes plus PRS scoring
 - one final Markdown report
 
+Supported execution modes:
+- `both`
+- `monogenic-only`
+- `prs-only`
+
 ## Scope
 
 Supported:
@@ -81,6 +86,8 @@ The heavy runtime/cache state lives under `runtime.linux_cache_root`, not in the
 
 Example tracked manifest:
 - `manifests/examples/sample.yaml`
+- `manifests/examples/sample.monogenic.yaml`
+- `manifests/examples/sample.prs.yaml`
 
 Main fields:
 - `sample_id`
@@ -97,6 +104,13 @@ Main fields:
 PRS score lists can come from either:
 - `analysis.prs.score_preset`
 - `analysis.prs.pgs_ids`
+
+Execution mode is derived from the enabled analysis branches:
+- `analysis.monogenic.enabled: true` and `analysis.prs.enabled: true` -> `both`
+- `analysis.monogenic.enabled: true` and `analysis.prs.enabled: false` -> `monogenic-only`
+- `analysis.monogenic.enabled: false` and `analysis.prs.enabled: true` -> `prs-only`
+
+The pipeline intentionally rejects manifests where both branches are disabled.
 
 If `analysis.prs.sample_sex` is set to `male` or `female`, the PRS compatibility step keeps sex chromosomes and writes a one-sample `.psam` for downstream tools. If it is omitted, PRS compatibility falls back to autosomes only.
 
@@ -124,6 +138,11 @@ Tracked example:
 
 Final reader-facing result:
 - `output/results/<sample>/<run_id>/report/report.md`
+
+The report title and sections adapt to the execution mode:
+- `Genome Report` for `both`
+- `Monogenic Report` for `monogenic-only`
+- `PRS Report` for `prs-only`
 
 Technical manifests:
 - `output/results/<sample>/<run_id>/report/artifact_manifest.json`

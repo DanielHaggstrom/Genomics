@@ -4,7 +4,10 @@ import pathlib
 import tempfile
 import unittest
 
-from workflow.core.manifest import apply_defaults, expand_score_preset
+from workflow.core.manifest import apply_defaults, derive_execution_mode, expand_score_preset, validate_manifest_file
+
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 class ValidateManifestTests(unittest.TestCase):
@@ -72,6 +75,66 @@ class ValidateManifestTests(unittest.TestCase):
             manifest = expand_score_preset(manifest, manifest_path)
 
         self.assertEqual(manifest["analysis"]["prs"]["pgs_ids"], ["PGS999002"])
+
+    def test_derive_execution_mode(self) -> None:
+        both = apply_defaults(
+            {
+                "sample_id": "TEST",
+                "inputs": {"cram": "a", "crai": "b"},
+                "reference": {"build": "GRCh38", "bundle_id": "bundle"},
+                "analysis": {"monogenic": {"enabled": True}, "prs": {"enabled": True, "pgs_ids": ["PGS999001"]}},
+            }
+        )
+        self.assertEqual(derive_execution_mode(both), "both")
+
+        monogenic_only = apply_defaults(
+            {
+                "sample_id": "TEST",
+                "inputs": {"cram": "a", "crai": "b"},
+                "reference": {"build": "GRCh38", "bundle_id": "bundle"},
+                "analysis": {"monogenic": {"enabled": True}, "prs": {"enabled": False}},
+            }
+        )
+        self.assertEqual(derive_execution_mode(monogenic_only), "monogenic-only")
+
+        prs_only = apply_defaults(
+            {
+                "sample_id": "TEST",
+                "inputs": {"cram": "a", "crai": "b"},
+                "reference": {"build": "GRCh38", "bundle_id": "bundle"},
+                "analysis": {"monogenic": {"enabled": False}, "prs": {"enabled": True, "pgs_ids": ["PGS999001"]}},
+            }
+        )
+        self.assertEqual(derive_execution_mode(prs_only), "prs-only")
+
+    def test_validate_manifest_rejects_both_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            manifest_path = tmp / "sample.yaml"
+            manifest_path.write_text(
+                "\n".join(
+                    [
+                        "sample_id: TEST_SAMPLE",
+                        "inputs:",
+                        "  cram: /mnt/c/data/sample.cram",
+                        "  crai: /mnt/c/data/sample.cram.crai",
+                        "reference:",
+                        "  build: GRCh38",
+                        "  bundle_id: bundle",
+                        "analysis:",
+                        "  monogenic:",
+                        "    enabled: false",
+                        "  prs:",
+                        "    enabled: false",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            schema_path = REPO_ROOT / "manifests" / "schema" / "run_manifest.schema.json"
+            with self.assertRaises(SystemExit) as ctx:
+                validate_manifest_file(manifest_path, schema_path)
+        self.assertIn("At least one analysis stage must be enabled", str(ctx.exception))
 
 
 if __name__ == "__main__":

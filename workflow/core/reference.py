@@ -409,6 +409,7 @@ def cmd_prepare_context(args: argparse.Namespace) -> int:
     validated = load_json(args.validated_manifest)
     manifest_path = pathlib.Path(validated["manifest_path"]).resolve()
     manifest = validated["manifest"]
+    execution_mode = validated.get("execution_mode") or "both"
 
     linux_cache_root = pathlib.Path(normalize_path(manifest["runtime"]["linux_cache_root"], base_dir=manifest_path.parent))
     project_cache_root = ensure_dir(linux_cache_root / project_cache_id())
@@ -580,6 +581,7 @@ def cmd_prepare_context(args: argparse.Namespace) -> int:
         "repo_root": str(REPO_ROOT),
         "manifest_path": str(manifest_path),
         "manifest": manifest,
+        "execution_mode": execution_mode,
         "sample_id": manifest["sample_id"],
         "input_fingerprint": input_fingerprint,
         "inputs": {

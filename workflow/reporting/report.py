@@ -8,6 +8,7 @@ import pathlib
 import shutil
 from typing import Any
 
+from workflow.core.manifest import derive_execution_mode
 from workflow.core.runtime import ensure_dir, load_json, write_json
 
 
@@ -65,17 +66,27 @@ def render_report(
     write_json(artifact_manifest_path, summary_artifacts)
 
     report_path = report_dir / "report.md"
+    execution_mode = context.get("execution_mode") or derive_execution_mode(context["manifest"])
     reference_probe = context["reference_probe"]
     reference_stage = context["reference_bundle"]
     prs_dense = prs_stage.get("dense_genotypes") or {}
     prs_rows = read_prs_rows((prs_stage.get("artifacts") or {}).get("aggregated_scores"))
+    monogenic_enabled = bool(context["manifest"]["analysis"]["monogenic"]["enabled"])
+    prs_enabled = bool(context["manifest"]["analysis"]["prs"]["enabled"])
+    if execution_mode == "monogenic-only":
+        report_title = "Monogenic Report"
+    elif execution_mode == "prs-only":
+        report_title = "PRS Report"
+    else:
+        report_title = "Genome Report"
 
     with open(report_path, "w", encoding="utf-8") as out:
-        out.write(f"# Genome Report: {context['sample_id']}\n\n")
+        out.write(f"# {report_title}: {context['sample_id']}\n\n")
         out.write("Research-use summary for the canonical CRAM-first pipeline.\n\n")
 
         out.write("## Summary\n")
         out.write(f"- Sample ID: `{context['sample_id']}`\n")
+        out.write(f"- Execution mode: `{execution_mode}`\n")
         out.write(f"- Input fingerprint: `{context['input_fingerprint']['id']}`\n")
         out.write(f"- Reference probe: `{reference_probe.get('status', 'unknown')}`\n")
         out.write(f"- Reference bundle: `{reference_stage.get('status', 'unknown')}`\n")
@@ -118,65 +129,67 @@ def render_report(
             out.write(f"- Bundle note: {reference_stage['message']}\n")
         out.write("\n")
 
-        out.write("## Monogenic\n")
-        if monogenic_stage.get("status") == "ok":
-            out.write(f"- Source mode: `{monogenic_stage.get('source_mode', 'unknown')}`\n")
-            import_details = monogenic_stage.get("import_details")
-            if import_details:
-                out.write(f"- Import provenance: `{import_details.get('provenance')}`\n")
-            summary = monogenic_stage.get("summary") or {}
-            out.write(f"- Priority rows after dedup: `{summary.get('priority_rows_after_dedup', 'n/a')}`\n")
-            out.write(f"- Variant records scanned: `{summary.get('total_variant_records_seen', 'n/a')}`\n")
-            artifacts = monogenic_stage.get("artifacts") or {}
-            out.write(f"- Annotated VCF: `{artifacts.get('annotated_vcf', 'n/a')}`\n")
-            out.write(f"- ClinVar unique TSV: `{artifacts.get('clinvar_unique_tsv', 'n/a')}`\n")
-            out.write(f"- LoF unique TSV: `{artifacts.get('lof_unique_tsv', 'n/a')}`\n")
-            out.write(f"- Review queue unique TSV: `{artifacts.get('review_unique_tsv', 'n/a')}`\n")
-        else:
-            out.write(f"- Status: `{monogenic_stage.get('status', 'unknown')}`\n")
-            if monogenic_stage.get("message"):
-                out.write(f"- Detail: {monogenic_stage['message']}\n")
-        out.write("\n")
+        if monogenic_enabled:
+            out.write("## Monogenic\n")
+            if monogenic_stage.get("status") == "ok":
+                out.write(f"- Source mode: `{monogenic_stage.get('source_mode', 'unknown')}`\n")
+                import_details = monogenic_stage.get("import_details")
+                if import_details:
+                    out.write(f"- Import provenance: `{import_details.get('provenance')}`\n")
+                summary = monogenic_stage.get("summary") or {}
+                out.write(f"- Priority rows after dedup: `{summary.get('priority_rows_after_dedup', 'n/a')}`\n")
+                out.write(f"- Variant records scanned: `{summary.get('total_variant_records_seen', 'n/a')}`\n")
+                artifacts = monogenic_stage.get("artifacts") or {}
+                out.write(f"- Annotated VCF: `{artifacts.get('annotated_vcf', 'n/a')}`\n")
+                out.write(f"- ClinVar unique TSV: `{artifacts.get('clinvar_unique_tsv', 'n/a')}`\n")
+                out.write(f"- LoF unique TSV: `{artifacts.get('lof_unique_tsv', 'n/a')}`\n")
+                out.write(f"- Review queue unique TSV: `{artifacts.get('review_unique_tsv', 'n/a')}`\n")
+            else:
+                out.write(f"- Status: `{monogenic_stage.get('status', 'unknown')}`\n")
+                if monogenic_stage.get("message"):
+                    out.write(f"- Detail: {monogenic_stage['message']}\n")
+            out.write("\n")
 
-        out.write("## PRS\n")
-        if prs_dense:
-            out.write(f"- Dense genotype stage status: `{prs_dense.get('status', 'unknown')}`\n")
-            import_details = prs_dense.get("import_details")
-            if import_details:
-                out.write(f"- Dense genotype import provenance: `{import_details.get('provenance')}`\n")
-            dense_summary = prs_dense.get("summary") or {}
-            if dense_summary.get("union_sites") is not None:
-                out.write(f"- Union sites requested: `{dense_summary['union_sites']}`\n")
-            dense_artifacts = prs_dense.get("artifacts") or {}
-            if dense_artifacts.get("dense_vcf"):
-                out.write(f"- Dense PRS VCF: `{dense_artifacts['dense_vcf']}`\n")
-            if dense_artifacts.get("targets_vcf"):
-                out.write(f"- Union targets VCF: `{dense_artifacts['targets_vcf']}`\n")
+        if prs_enabled:
+            out.write("## PRS\n")
+            if prs_dense:
+                out.write(f"- Dense genotype stage status: `{prs_dense.get('status', 'unknown')}`\n")
+                import_details = prs_dense.get("import_details")
+                if import_details:
+                    out.write(f"- Dense genotype import provenance: `{import_details.get('provenance')}`\n")
+                dense_summary = prs_dense.get("summary") or {}
+                if dense_summary.get("union_sites") is not None:
+                    out.write(f"- Union sites requested: `{dense_summary['union_sites']}`\n")
+                dense_artifacts = prs_dense.get("artifacts") or {}
+                if dense_artifacts.get("dense_vcf"):
+                    out.write(f"- Dense PRS VCF: `{dense_artifacts['dense_vcf']}`\n")
+                if dense_artifacts.get("targets_vcf"):
+                    out.write(f"- Union targets VCF: `{dense_artifacts['targets_vcf']}`\n")
 
-        out.write(f"- PRS scoring status: `{prs_stage.get('status', 'unknown')}`\n")
-        if prs_stage.get("status") == "ok":
-            artifacts = prs_stage.get("artifacts") or {}
-            out.write(f"- Aggregated scores: `{artifacts.get('aggregated_scores', 'n/a')}`\n")
-            if artifacts.get("pgsc_report_html"):
-                out.write(f"- pgsc_calc HTML report: `{artifacts['pgsc_report_html']}`\n")
-            if prs_rows:
-                out.write("\n| PGS | IID | SUM |\n")
-                out.write("| --- | --- | --- |\n")
-                for row in prs_rows:
-                    out.write(f"| {row['PGS']} | {row['IID']} | {row['SUM']} |\n")
-                out.write("\n")
-        else:
-            diagnostics = prs_stage.get("diagnostics") or {}
-            if prs_stage.get("message"):
-                out.write(f"- Detail: {prs_stage['message']}\n")
-            overlap_failures = diagnostics.get("overlap_failures") or []
-            if overlap_failures:
-                out.write("- Matching threshold diagnostics:\n")
-                for item in overlap_failures:
-                    out.write(f"  - `{item['score']}` matched `{item['match_percent']}%`\n")
-            if diagnostics.get("log_path"):
-                out.write(f"- Log: `{diagnostics['log_path']}`\n")
-        out.write("\n")
+            out.write(f"- PRS scoring status: `{prs_stage.get('status', 'unknown')}`\n")
+            if prs_stage.get("status") == "ok":
+                artifacts = prs_stage.get("artifacts") or {}
+                out.write(f"- Aggregated scores: `{artifacts.get('aggregated_scores', 'n/a')}`\n")
+                if artifacts.get("pgsc_report_html"):
+                    out.write(f"- pgsc_calc HTML report: `{artifacts['pgsc_report_html']}`\n")
+                if prs_rows:
+                    out.write("\n| PGS | IID | SUM |\n")
+                    out.write("| --- | --- | --- |\n")
+                    for row in prs_rows:
+                        out.write(f"| {row['PGS']} | {row['IID']} | {row['SUM']} |\n")
+                    out.write("\n")
+            else:
+                diagnostics = prs_stage.get("diagnostics") or {}
+                if prs_stage.get("message"):
+                    out.write(f"- Detail: {prs_stage['message']}\n")
+                overlap_failures = diagnostics.get("overlap_failures") or []
+                if overlap_failures:
+                    out.write("- Matching threshold diagnostics:\n")
+                    for item in overlap_failures:
+                        out.write(f"  - `{item['score']}` matched `{item['match_percent']}%`\n")
+                if diagnostics.get("log_path"):
+                    out.write(f"- Log: `{diagnostics['log_path']}`\n")
+            out.write("\n")
 
         out.write("## Limitations\n")
         out.write("- Research use only; this pipeline does not produce clinical diagnoses.\n")
@@ -190,6 +203,7 @@ def render_report(
 
     summary = {
         "sample_id": context["sample_id"],
+        "execution_mode": execution_mode,
         "report_path": str(report_path),
         "artifact_manifest_path": str(artifact_manifest_path),
         "enabled_stages": {

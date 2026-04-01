@@ -1,0 +1,31 @@
+sample_id: DEMO_SAMPLE_001
+
+inputs:
+  cram: /mnt/c/path/to/DEMO_SAMPLE_001.cram
+  crai: /mnt/c/path/to/DEMO_SAMPLE_001.cram.crai
+
+reference:
+  build: GRCh38
+  bundle_id: grch38_dragen_alt_masked
+  autodownload: false
+  remote_decode_probe: false
+
+analysis:
+  monogenic:
+    enabled: true
+    mode: moderate
+    max_af: 0.05
+    vep_forks: 8
+  prs:
+    enabled: false
+
+runtime:
+  profile: docker
+  max_memory: 14.GB
+  max_cpus: 8
+  min_free_gb: 40
+  linux_cache_root: ~/.cache/genomics
+
+outputs:
+  results_dir: output/results
+  run_id: latest
