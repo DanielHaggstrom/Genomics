@@ -44,7 +44,6 @@ Path of highest sanity:
 - improve progress visibility before adding new features
 
 Concrete next steps:
-- expose clearer stage progress in logs or manifests
 - define explicit operator commands for tuning and resuming runs
 - investigate safe live tuning during a run; if true live changes are not reliable, support a documented graceful stop-and-resume path that preserves completed shard work
 
@@ -74,6 +73,9 @@ Explicit non-goals for this phase:
 Status:
 - automatic worker planning is now implemented for monogenic and PRS dense genotyping
 - narrow per-stage override knobs are now part of the manifest schema
+- long-running monogenic and PRS stages now emit incremental stage-status updates during shard work
+- `run.sh` now forwards extra Nextflow flags, so `bash run.sh manifests/local/<sample>.yaml -resume` is a supported operator path
+- `make status RUN=...` now reports the cache/log/stage-status files to watch during a run
 - live tuning during an active run is still future work
 
 ### 3. Harden cache and import behavior
@@ -238,4 +240,4 @@ Guardrails for this cleanup phase:
 - Done: execution mode is now explicit and derived as `monogenic-only`, `prs-only`, or `both`, with tracked example manifests and report output that adapts to the selected mode.
 - Done: resource-aware worker planning is now implemented for monogenic and PRS dense-genotype stages, with optional narrow manifest overrides for workers and `pairhmm_threads`.
 - In progress: PRS direct-from-WGS harmonization; scoring still fails the configured overlap threshold in the last measured run.
-- Next likely improvement: expose clearer stage progress and a documented stop-adjust-resume path before deciding whether any true live tuning support is worth adding.
+- Next likely improvement: confirm completed shard reuse after interruption now that resume/visibility are easier to use, then decide whether any true live tuning support is worth adding.
