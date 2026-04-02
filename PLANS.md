@@ -159,6 +159,10 @@ Decision update:
   - first make imputation a real manifest/stage-boundary concept in the repo
   - then add the local backend against a pinned reference panel
   - do not try to hide an unfinished local backend behind silent fallbacks
+- first local-backend caveat:
+  - because this repo is single-sample, do not wire `conform-gt` into the canonical local path by default
+  - official `conform-gt` docs say the target VCF should have at least 20 individuals so its statistical strand checks are meaningful
+  - for the first local backend, require same-build reference-panel resources and use normalized target VCFs directly with Beagle instead
 
 ### 4a. Add A Standard PRS-Compatible Imputation Layer
 
@@ -368,6 +372,12 @@ Guardrails for this cleanup phase:
   - `analysis.prs.imputation`
   - `reuse.imputed_prs_vcf`
   - report/manifests now distinguish dense-direct PRS input from imported imputed PRS input
+- Done: the first local PRS imputation backend is now wired into the PRS stage:
+  - `analysis.prs.imputation.enabled: true` now builds a cached imputed PRS VCF instead of failing fast
+  - local Beagle JAR download is pinned and cached under the Linux-side tool cache
+  - per-chromosome panel manifests are now a first-class config concept via `manifests/*/imputation_panels/`
+  - the report now surfaces local imputation backend/panel details
+- In progress: the local PRS imputation backend has not yet been exercised end-to-end against a real GRCh38 reference panel in this repo.
 - Done: execution mode is now explicit and derived as `monogenic-only`, `prs-only`, or `both`, with tracked example manifests and report output that adapts to the selected mode.
 - Done: resource-aware worker planning is now implemented for monogenic and PRS dense-genotype stages, with optional narrow manifest overrides for workers and `pairhmm_threads`.
 - Done: cache-side shard progress now records reused vs rebuilt shard completions for monogenic and PRS dense genotyping.
