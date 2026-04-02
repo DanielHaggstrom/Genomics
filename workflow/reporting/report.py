@@ -36,6 +36,21 @@ def read_prs_rows(path: str | None, limit: int = 20) -> list[dict[str, str]]:
     return rows
 
 
+def render_import_details(out: Any, import_details: dict[str, Any] | None, *, prefix: str = "Import") -> None:
+    if not import_details:
+        return
+    out.write(f"- {prefix} provenance: `{import_details.get('provenance', 'unknown')}`\n")
+    if import_details.get("source"):
+        out.write(f"- {prefix} source path: `{import_details['source']}`\n")
+    if import_details.get("active") and import_details.get("active") != import_details.get("source"):
+        out.write(f"- {prefix} active path: `{import_details['active']}`\n")
+    out.write(f"- {prefix} trusted provenance: `{bool(import_details.get('trusted_provenance'))}`\n")
+    if import_details.get("stage_manifest"):
+        out.write(f"- {prefix} stage manifest: `{import_details['stage_manifest']}`\n")
+    elif not import_details.get("trusted_provenance"):
+        out.write(f"- {prefix} note: external import without repo-generated stage manifest\n")
+
+
 def render_report(
     context: dict[str, Any],
     monogenic_stage: dict[str, Any],
@@ -134,8 +149,7 @@ def render_report(
             if monogenic_stage.get("status") == "ok":
                 out.write(f"- Source mode: `{monogenic_stage.get('source_mode', 'unknown')}`\n")
                 import_details = monogenic_stage.get("import_details")
-                if import_details:
-                    out.write(f"- Import provenance: `{import_details.get('provenance')}`\n")
+                render_import_details(out, import_details)
                 summary = monogenic_stage.get("summary") or {}
                 out.write(f"- Priority rows after dedup: `{summary.get('priority_rows_after_dedup', 'n/a')}`\n")
                 out.write(f"- Variant records scanned: `{summary.get('total_variant_records_seen', 'n/a')}`\n")
@@ -155,8 +169,7 @@ def render_report(
             if prs_dense:
                 out.write(f"- Dense genotype stage status: `{prs_dense.get('status', 'unknown')}`\n")
                 import_details = prs_dense.get("import_details")
-                if import_details:
-                    out.write(f"- Dense genotype import provenance: `{import_details.get('provenance')}`\n")
+                render_import_details(out, import_details, prefix="Dense genotype import")
                 dense_summary = prs_dense.get("summary") or {}
                 if dense_summary.get("union_sites") is not None:
                     out.write(f"- Union sites requested: `{dense_summary['union_sites']}`\n")

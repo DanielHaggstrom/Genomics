@@ -87,6 +87,13 @@ class RenderReportTests(unittest.TestCase):
                     "lof_unique_tsv": "/cache/lof.tsv",
                     "review_unique_tsv": "/cache/review.tsv",
                 },
+                "import_details": {
+                    "provenance": "repo_stage_manifest",
+                    "source": "/external/annotated.vcf.gz",
+                    "active": "/cache/annotated.vcf.gz",
+                    "trusted_provenance": True,
+                    "stage_manifest": "/external/annotated.stage_manifest.json",
+                },
             }
             prs = {
                 "status": "ok",
@@ -96,6 +103,12 @@ class RenderReportTests(unittest.TestCase):
                     "artifacts": {
                         "dense_vcf": "/cache/dense.vcf.gz",
                         "targets_vcf": "/cache/targets.vcf.gz",
+                    },
+                    "import_details": {
+                        "provenance": "external_import",
+                        "source": "/external/dense.vcf.gz",
+                        "active": "/cache/dense.vcf.gz",
+                        "trusted_provenance": False,
                     },
                 },
                 "artifacts": {
@@ -143,6 +156,8 @@ class RenderReportTests(unittest.TestCase):
             self.assertIn("Active CRAM path: `/home/user/.cache/genomics/staging/sample.cram`", report_text)
             self.assertIn("Reference probe: `ok`", report_text)
             self.assertIn("Dense PRS VCF: `/cache/dense.vcf.gz`", report_text)
+            self.assertIn("Import stage manifest: `/external/annotated.stage_manifest.json`", report_text)
+            self.assertIn("Dense genotype import note: external import without repo-generated stage manifest", report_text)
 
     def test_render_report_prs_only_omits_monogenic_section(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
