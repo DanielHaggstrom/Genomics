@@ -378,6 +378,10 @@ Guardrails for this cleanup phase:
   - per-chromosome panel manifests are now a first-class config concept via `manifests/*/imputation_panels/`
   - the report now surfaces local imputation backend/panel details
 - In progress: the local PRS imputation backend has not yet been exercised end-to-end against a real GRCh38 reference panel in this repo.
+- Done: a real local GRCh38 panel family has now been chosen and staged for the first end-to-end imputed PRS run:
+  - IGSR / 1000 Genomes GRCh38 phased panel from `20190312_biallelic_SNV_and_INDEL`
+  - Beagle GRCh38 `no_chr_in_chrom_field` genetic maps
+  - local ignored manifest path prepared under `manifests/local/imputation_panels/`
 - Done: execution mode is now explicit and derived as `monogenic-only`, `prs-only`, or `both`, with tracked example manifests and report output that adapts to the selected mode.
 - Done: resource-aware worker planning is now implemented for monogenic and PRS dense-genotype stages, with optional narrow manifest overrides for workers and `pairhmm_threads`.
 - Done: cache-side shard progress now records reused vs rebuilt shard completions for monogenic and PRS dense genotyping.
