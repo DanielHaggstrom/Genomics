@@ -11,9 +11,9 @@ import urllib.request
 from typing import Any
 
 from workflow.core.runtime import (
-    artifacts_exist,
     build_docker_run_command,
     complete_artifact,
+    complete_artifacts_exist,
     ensure_dir,
     ensure_docker_ready,
     hash_strings,
@@ -174,7 +174,7 @@ def build_union_sites(
     if union_manifest_path.exists():
         payload = load_json(union_manifest_path)
         artifacts = payload.get("artifacts") or {}
-        if payload.get("reuse_key") == reuse_key and artifacts_exist([artifacts.get("targets_vcf"), artifacts.get("targets_vcf_index")]):
+        if payload.get("reuse_key") == reuse_key and complete_artifacts_exist([artifacts.get("targets_vcf")]):
             return payload
 
     score_cache_root = ensure_dir(pathlib.Path(context["runtime"]["tool_cache_root"]) / "pgs_scorefiles" / "GRCh38")
@@ -426,7 +426,7 @@ def concat_dense_vcf(stage_root: pathlib.Path, reference_fasta: pathlib.Path, sa
 
 
 def complete_pfile(prefix: pathlib.Path) -> bool:
-    return artifacts_exist(
+    return complete_artifacts_exist(
         [
             str(prefix) + ".pgen",
             str(prefix) + ".psam",
@@ -574,7 +574,17 @@ def load_existing_stage(stage_manifest_path: pathlib.Path, cache_key: str) -> di
     if payload.get("cache_key") != cache_key or payload.get("status") != "ok":
         return None
     artifacts = payload.get("artifacts") or {}
-    if not artifacts_exist([artifacts.get("aggregated_scores")]):
+    required_artifacts = [
+        artifacts.get("aggregated_scores"),
+        artifacts.get("dense_vcf"),
+        artifacts.get("compatible_pgen"),
+        artifacts.get("compatible_psam"),
+        artifacts.get("compatible_pvar"),
+    ]
+    if not complete_artifacts_exist(required_artifacts):
+        return None
+    dense_artifacts = (payload.get("dense_genotypes") or {}).get("artifacts") or {}
+    if not complete_artifacts_exist([dense_artifacts.get("dense_vcf")]):
         return None
     payload["reused"] = True
     return payload

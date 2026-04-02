@@ -10,9 +10,9 @@ from collections import defaultdict
 from typing import Any, Iterator
 
 from workflow.core.runtime import (
-    artifacts_exist,
     build_docker_run_command,
     complete_artifact,
+    complete_artifacts_exist,
     ensure_dir,
     ensure_docker_ready,
     init_shard_progress,
@@ -169,7 +169,7 @@ def load_existing_stage(stage_manifest_path: pathlib.Path, cache_key: str, requi
     if payload.get("cache_key") != cache_key or payload.get("status") != "ok":
         return None
     artifacts = payload.get("artifacts") or {}
-    if not artifacts_exist([artifacts.get(key) for key in required_artifacts]):
+    if not complete_artifacts_exist([artifacts.get(key) for key in required_artifacts]):
         return None
     payload["reused"] = True
     return payload

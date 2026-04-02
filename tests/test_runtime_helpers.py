@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from workflow.core.runtime import (
+    complete_artifacts_exist,
     format_java_memory_mb,
     init_shard_progress,
     parse_memory_to_gb,
@@ -15,6 +18,15 @@ from workflow.core.runtime import (
 
 
 class RuntimeHelperTests(unittest.TestCase):
+    def test_complete_artifacts_exist_requires_vcf_sidecars(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            vcf = tmp / "sample.vcf.gz"
+            vcf.write_text("placeholder", encoding="utf-8")
+            self.assertFalse(complete_artifacts_exist([vcf]))
+            (tmp / "sample.vcf.gz.tbi").write_text("index", encoding="utf-8")
+            self.assertTrue(complete_artifacts_exist([vcf]))
+
     def test_plan_contig_shards_groups_non_primary_contigs_into_alt(self) -> None:
         shards = plan_contig_shards(["chr1", "chr2", "chrUn_KI270442v1", "chrEBV"], "chr")
         self.assertEqual(shards[0]["name"], "chr1")

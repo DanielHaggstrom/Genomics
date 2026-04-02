@@ -177,6 +177,15 @@ def complete_artifact(main_path: str | pathlib.Path, *, extra_sidecars: Iterable
     return all(sidecar.exists() for sidecar in sidecars)
 
 
+def complete_artifacts_exist(paths: Iterable[str | pathlib.Path | None]) -> bool:
+    for raw in paths:
+        if not raw:
+            continue
+        if not complete_artifact(raw):
+            return False
+    return True
+
+
 def run_command(
     args: list[str],
     *,
