@@ -7,7 +7,7 @@ import gzip
 import pathlib
 import urllib.request
 from collections import defaultdict
-from typing import Any
+from typing import Any, Iterator
 
 from workflow.core.runtime import (
     artifacts_exist,
@@ -80,6 +80,31 @@ def parse_info(info: str) -> dict[str, Any]:
         else:
             out[item] = True
     return out
+
+
+def parse_csq_fields(line: str) -> list[str]:
+    marker = "Format: "
+    idx = line.find(marker)
+    if idx == -1:
+        return []
+    return line[idx + len(marker):].rstrip('">').split("|")
+
+
+def parse_sample_map(fmt: str, sample: str) -> dict[str, str]:
+    return dict(zip(fmt.split(":"), sample.split(":")))
+
+
+def iter_carried_annotations(csq_blob: str, csq_fields: list[str], carried_alts: set[str]) -> Iterator[dict[str, str]]:
+    for ann in csq_blob.split(","):
+        parts = ann.split("|")
+        if len(parts) < len(csq_fields):
+            parts += [""] * (len(csq_fields) - len(parts))
+        ann_map = dict(zip(csq_fields, parts))
+        if carried_alts:
+            allele = ann_map.get("Allele", "")
+            if allele and allele not in carried_alts:
+                continue
+        yield ann_map
 
 
 def carried_alt_alleles(gt: str, alt: str) -> set[str]:
@@ -158,101 +183,111 @@ def write_tsv(path: pathlib.Path, rows: list[dict[str, str]], header: list[str])
         writer.writerows(rows)
 
 
-def extract_priority_variants(input_vcf: pathlib.Path, output_tsv: pathlib.Path, summary_txt: pathlib.Path) -> dict[str, str]:
+def iter_annotated_variants(input_vcf: pathlib.Path) -> Iterator[dict[str, Any]]:
     csq_fields: list[str] = []
-    total_records = 0
-    priority_rows: list[dict[str, str]] = []
-    reason_counts: defaultdict[str, int] = defaultdict(int)
 
     with gzip.open(input_vcf, "rt", encoding="utf-8", errors="replace") as handle:
         for raw in handle:
             line = raw.rstrip("\n")
             if line.startswith("##INFO=<ID=CSQ"):
-                marker = "Format: "
-                idx = line.find(marker)
-                if idx != -1:
-                    csq_fields = line[idx + len(marker):].rstrip('">').split("|")
+                csq_fields = parse_csq_fields(line)
                 continue
             if line.startswith("#"):
                 continue
 
-            total_records += 1
             cols = line.split("\t")
             if len(cols) < 10:
                 continue
+
             chrom, pos, vid, ref, alt, qual, flt, info, fmt, sample = cols[:10]
             info_blob = parse_info(info)
-            csq_blob = info_blob.get("CSQ", "")
-            if not csq_blob or not csq_fields:
-                continue
-
-            fmt_keys = fmt.split(":")
-            sample_values = sample.split(":")
-            sample_map = dict(zip(fmt_keys, sample_values))
+            sample_map = parse_sample_map(fmt, sample)
             gt = sample_map.get("GT", ".")
             carried_alts = carried_alt_alleles(gt, alt) if "," in alt else set()
+            csq_blob = info_blob.get("CSQ", "")
+            annotations = list(iter_carried_annotations(csq_blob, csq_fields, carried_alts)) if csq_blob and csq_fields else []
 
-            for ann in csq_blob.split(","):
-                parts = ann.split("|")
-                if len(parts) < len(csq_fields):
-                    parts += [""] * (len(csq_fields) - len(parts))
-                ann_map = dict(zip(csq_fields, parts))
+            yield {
+                "CHROM": chrom,
+                "POS": pos,
+                "ID": vid,
+                "REF": ref,
+                "ALT": alt,
+                "QUAL": qual,
+                "FILTER": flt,
+                "info_blob": info_blob,
+                "sample_map": sample_map,
+                "GT": gt,
+                "annotations": annotations,
+            }
 
-                if carried_alts:
-                    allele = ann_map.get("Allele", "")
-                    if allele and allele not in carried_alts:
-                        continue
 
-                consequence = ann_map.get("Consequence", "")
-                clin_sig = ann_map.get("CLIN_SIG", "")
-                cons_terms = {item.strip() for item in consequence.split("&") if item.strip()}
-                clin_terms = {item.strip().lower() for item in clin_sig.replace(" ", "_").split("&") if item.strip()}
-                lof_hit = any(term in LOF_TERMS for term in cons_terms)
-                clin_hit = any(term in CLIN_SIG_TERMS for term in clin_terms)
-                if not (lof_hit or clin_hit):
-                    continue
-
-                reasons = []
-                if clin_hit:
-                    reasons.append("clinvar_pathogenic_or_likely_pathogenic")
-                    reason_counts["clinvar_pathogenic_or_likely_pathogenic"] += 1
-                if lof_hit:
-                    reasons.append("predicted_loss_of_function")
-                    reason_counts["predicted_loss_of_function"] += 1
-
-                priority_rows.append(
-                    {
-                        "CHROM": chrom,
-                        "POS": pos,
-                        "ID": vid,
-                        "REF": ref,
-                        "ALT": alt,
-                        "FILTER": flt,
-                        "GT": gt,
-                        "DP": sample_map.get("DP", "."),
-                        "GQ": sample_map.get("GQ", "."),
-                        "AD": sample_map.get("AD", "."),
-                        "GENE_SYMBOL": ann_map.get("SYMBOL", ""),
-                        "GENE_ID": ann_map.get("Gene", ""),
-                        "CONSEQUENCE": consequence,
-                        "IMPACT": ann_map.get("IMPACT", ""),
-                        "CLIN_SIG": clin_sig,
-                        "EXISTING_VARIATION": ann_map.get("Existing_variation", ""),
-                        "HGVSc": ann_map.get("HGVSc", ""),
-                        "HGVSp": ann_map.get("HGVSp", ""),
-                        "CANONICAL": ann_map.get("CANONICAL", ""),
-                        "REASONS": ",".join(reasons),
-                    }
-                )
-
+def dedupe_exact_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     seen = set()
     deduped: list[dict[str, str]] = []
-    for row in priority_rows:
+    for row in rows:
         key = tuple(row.values())
         if key in seen:
             continue
         seen.add(key)
         deduped.append(row)
+    return deduped
+
+
+def extract_priority_variants(input_vcf: pathlib.Path, output_tsv: pathlib.Path, summary_txt: pathlib.Path) -> dict[str, str]:
+    total_records = 0
+    priority_rows: list[dict[str, str]] = []
+    reason_counts: defaultdict[str, int] = defaultdict(int)
+
+    for record in iter_annotated_variants(input_vcf):
+        total_records += 1
+        if not record["annotations"]:
+            continue
+
+        for ann_map in record["annotations"]:
+            consequence = ann_map.get("Consequence", "")
+            clin_sig = ann_map.get("CLIN_SIG", "")
+            cons_terms = {item.strip() for item in consequence.split("&") if item.strip()}
+            clin_terms = {item.strip().lower() for item in clin_sig.replace(" ", "_").split("&") if item.strip()}
+            lof_hit = any(term in LOF_TERMS for term in cons_terms)
+            clin_hit = any(term in CLIN_SIG_TERMS for term in clin_terms)
+            if not (lof_hit or clin_hit):
+                continue
+
+            reasons = []
+            if clin_hit:
+                reasons.append("clinvar_pathogenic_or_likely_pathogenic")
+                reason_counts["clinvar_pathogenic_or_likely_pathogenic"] += 1
+            if lof_hit:
+                reasons.append("predicted_loss_of_function")
+                reason_counts["predicted_loss_of_function"] += 1
+
+            priority_rows.append(
+                {
+                    "CHROM": record["CHROM"],
+                    "POS": record["POS"],
+                    "ID": record["ID"],
+                    "REF": record["REF"],
+                    "ALT": record["ALT"],
+                    "FILTER": record["FILTER"],
+                    "GT": record["GT"],
+                    "DP": record["sample_map"].get("DP", "."),
+                    "GQ": record["sample_map"].get("GQ", "."),
+                    "AD": record["sample_map"].get("AD", "."),
+                    "GENE_SYMBOL": ann_map.get("SYMBOL", ""),
+                    "GENE_ID": ann_map.get("Gene", ""),
+                    "CONSEQUENCE": consequence,
+                    "IMPACT": ann_map.get("IMPACT", ""),
+                    "CLIN_SIG": clin_sig,
+                    "EXISTING_VARIATION": ann_map.get("Existing_variation", ""),
+                    "HGVSc": ann_map.get("HGVSc", ""),
+                    "HGVSp": ann_map.get("HGVSp", ""),
+                    "CANONICAL": ann_map.get("CANONICAL", ""),
+                    "REASONS": ",".join(reasons),
+                }
+            )
+
+    deduped = dedupe_exact_rows(priority_rows)
 
     header = [
         "CHROM",
@@ -336,123 +371,86 @@ def build_shortlists(input_tsv: pathlib.Path, outdir: pathlib.Path) -> None:
 
 
 def triage_clinvar(input_vcf: pathlib.Path, output_tsv: pathlib.Path, *, mode: str, max_af: float) -> None:
-    csq_fields: list[str] = []
     rows: list[dict[str, str]] = []
-
-    with gzip.open(input_vcf, "rt", encoding="utf-8", errors="replace") as handle:
-        for raw in handle:
-            line = raw.rstrip("\n")
-            if line.startswith("##INFO=<ID=CSQ"):
-                csq_fields = line.split("Format: ", 1)[1].rstrip('">').split("|")
-                continue
-            if line.startswith("#"):
-                continue
-            chrom, pos, vid, ref, alt, qual, flt, info, fmt, sample = line.split("\t")[:10]
-            if flt != "PASS":
-                continue
-
-            info_blob = parse_info(info)
-            csq_blob = info_blob.get("CSQ", "")
-            if not csq_blob:
-                continue
-
-            fmt_keys = fmt.split(":")
-            sample_values = sample.split(":")
-            sample_map = dict(zip(fmt_keys, sample_values))
-            carried_alts = carried_alt_alleles(sample_map.get("GT", "."), alt) if "," in alt else set()
-
-            for ann in csq_blob.split(","):
-                parts = ann.split("|")
-                if len(parts) < len(csq_fields):
-                    parts += [""] * (len(csq_fields) - len(parts))
-                ann_map = dict(zip(csq_fields, parts))
-
-                if carried_alts:
-                    allele = ann_map.get("Allele", "")
-                    if allele and allele not in carried_alts:
-                        continue
-
-                consequence = ann_map.get("Consequence", "")
-                if not has_any_term(consequence, PROTEIN_ALTERING):
-                    continue
-
-                clnsig = ann_map.get("ClinVar_CLNSIG", "")
-                clnrev = ann_map.get("ClinVar_CLNREVSTAT", "")
-                if not is_plp(clnsig):
-                    continue
-
-                rev_tier = review_tier(clnrev)
-                conflict = has_conflict(clnsig, clnrev)
-                impact = ann_map.get("IMPACT", "")
-                canonical = ann_map.get("CANONICAL", "")
-                max_af_str = ann_map.get("MAX_AF", "")
-                max_af_value = parse_float(max_af_str)
-                select = False
-                reason = ""
-
-                if mode == "strict":
-                    if (not conflict) and rev_tier == "high" and max_af_value is not None and max_af_value <= max_af:
-                        select = True
-                        reason = "high_review_and_rare"
-                elif mode == "moderate":
-                    if max_af_value is not None and max_af_value <= max_af and (rev_tier != "none" or impact == "HIGH" or has_any_term(consequence, LOF_TERMS)):
-                        select = True
-                        reason = "rare_plp_conflicting" if conflict else "rare_plp_reviewed"
-                    elif max_af_value is None and (impact == "HIGH" or has_any_term(consequence, LOF_TERMS)) and rev_tier != "none":
-                        select = True
-                        reason = "high_impact_missing_af"
-                else:
-                    if (not conflict) and max_af_value is not None and max_af_value <= max_af:
-                        select = True
-                        reason = "nonconflicting_plp_low_frequency"
-                    elif (not conflict) and max_af_value is None and (impact == "HIGH" or has_any_term(consequence, LOF_TERMS) or canonical == "YES"):
-                        select = True
-                        reason = "nonconflicting_plp_severe_missing_af"
-                    elif conflict and max_af_value is not None and max_af_value <= 0.01 and (impact == "HIGH" or has_any_term(consequence, LOF_TERMS)):
-                        select = True
-                        reason = "conflicting_but_rare_high_impact"
-
-                if not select:
-                    continue
-
-                rows.append(
-                    {
-                        "CHROM": chrom,
-                        "POS": pos,
-                        "ID": vid,
-                        "REF": ref,
-                        "ALT": alt,
-                        "GT": sample_map.get("GT", "."),
-                        "DP": sample_map.get("DP", "."),
-                        "GQ": sample_map.get("GQ", "."),
-                        "GENE_SYMBOL": ann_map.get("SYMBOL", ""),
-                        "GENE_ID": ann_map.get("Gene", ""),
-                        "CONSEQUENCE": consequence,
-                        "IMPACT": impact,
-                        "CANONICAL": canonical,
-                        "HGVSc": ann_map.get("HGVSc", ""),
-                        "HGVSp": ann_map.get("HGVSp", ""),
-                        "EXISTING_VARIATION": ann_map.get("Existing_variation", ""),
-                        "CLINVAR_CLNSIG": clnsig,
-                        "CLINVAR_CLNREVSTAT": clnrev,
-                        "CLINVAR_CLNDN": ann_map.get("ClinVar_CLNDN", ""),
-                        "MAX_AF": max_af_str,
-                        "MAX_AF_POPS": ann_map.get("MAX_AF_POPS", ""),
-                        "CLINVAR_CONFLICT_FLAG": "YES" if conflict else "NO",
-                        "REVIEW_TIER": rev_tier,
-                        "SELECTION_MODE": mode,
-                        "SELECTION_REASON": reason,
-                    }
-                )
-
-    seen = set()
-    deduped: list[dict[str, str]] = []
-    for row in rows:
-        key = tuple(row.values())
-        if key in seen:
+    for record in iter_annotated_variants(input_vcf):
+        if record["FILTER"] != "PASS" or not record["annotations"]:
             continue
-        seen.add(key)
-        deduped.append(row)
+
+        for ann_map in record["annotations"]:
+            consequence = ann_map.get("Consequence", "")
+            if not has_any_term(consequence, PROTEIN_ALTERING):
+                continue
+
+            clnsig = ann_map.get("ClinVar_CLNSIG", "")
+            clnrev = ann_map.get("ClinVar_CLNREVSTAT", "")
+            if not is_plp(clnsig):
+                continue
+
+            rev_tier = review_tier(clnrev)
+            conflict = has_conflict(clnsig, clnrev)
+            impact = ann_map.get("IMPACT", "")
+            canonical = ann_map.get("CANONICAL", "")
+            max_af_str = ann_map.get("MAX_AF", "")
+            max_af_value = parse_float(max_af_str)
+            select = False
+            reason = ""
+
+            if mode == "strict":
+                if (not conflict) and rev_tier == "high" and max_af_value is not None and max_af_value <= max_af:
+                    select = True
+                    reason = "high_review_and_rare"
+            elif mode == "moderate":
+                if max_af_value is not None and max_af_value <= max_af and (rev_tier != "none" or impact == "HIGH" or has_any_term(consequence, LOF_TERMS)):
+                    select = True
+                    reason = "rare_plp_conflicting" if conflict else "rare_plp_reviewed"
+                elif max_af_value is None and (impact == "HIGH" or has_any_term(consequence, LOF_TERMS)) and rev_tier != "none":
+                    select = True
+                    reason = "high_impact_missing_af"
+            else:
+                if (not conflict) and max_af_value is not None and max_af_value <= max_af:
+                    select = True
+                    reason = "nonconflicting_plp_low_frequency"
+                elif (not conflict) and max_af_value is None and (impact == "HIGH" or has_any_term(consequence, LOF_TERMS) or canonical == "YES"):
+                    select = True
+                    reason = "nonconflicting_plp_severe_missing_af"
+                elif conflict and max_af_value is not None and max_af_value <= 0.01 and (impact == "HIGH" or has_any_term(consequence, LOF_TERMS)):
+                    select = True
+                    reason = "conflicting_but_rare_high_impact"
+
+            if not select:
+                continue
+
+            rows.append(
+                {
+                    "CHROM": record["CHROM"],
+                    "POS": record["POS"],
+                    "ID": record["ID"],
+                    "REF": record["REF"],
+                    "ALT": record["ALT"],
+                    "GT": record["GT"],
+                    "DP": record["sample_map"].get("DP", "."),
+                    "GQ": record["sample_map"].get("GQ", "."),
+                    "GENE_SYMBOL": ann_map.get("SYMBOL", ""),
+                    "GENE_ID": ann_map.get("Gene", ""),
+                    "CONSEQUENCE": consequence,
+                    "IMPACT": impact,
+                    "CANONICAL": canonical,
+                    "HGVSc": ann_map.get("HGVSc", ""),
+                    "HGVSp": ann_map.get("HGVSp", ""),
+                    "EXISTING_VARIATION": ann_map.get("Existing_variation", ""),
+                    "CLINVAR_CLNSIG": clnsig,
+                    "CLINVAR_CLNREVSTAT": clnrev,
+                    "CLINVAR_CLNDN": ann_map.get("ClinVar_CLNDN", ""),
+                    "MAX_AF": max_af_str,
+                    "MAX_AF_POPS": ann_map.get("MAX_AF_POPS", ""),
+                    "CLINVAR_CONFLICT_FLAG": "YES" if conflict else "NO",
+                    "REVIEW_TIER": rev_tier,
+                    "SELECTION_MODE": mode,
+                    "SELECTION_REASON": reason,
+                }
+            )
+
+    deduped = dedupe_exact_rows(rows)
 
     header = list(deduped[0].keys()) if deduped else [
         "CHROM", "POS", "ID", "REF", "ALT", "GT", "DP", "GQ", "GENE_SYMBOL", "GENE_ID",
