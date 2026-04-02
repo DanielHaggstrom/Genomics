@@ -4,10 +4,12 @@ import unittest
 
 from workflow.core.runtime import (
     format_java_memory_mb,
+    init_shard_progress,
     parse_memory_to_gb,
     parse_memory_to_mb,
     plan_contig_shards,
     plan_worker_pool,
+    record_shard_completion,
     run_tasks_in_parallel,
 )
 
@@ -89,6 +91,16 @@ class RuntimeHelperTests(unittest.TestCase):
         )
         self.assertEqual(results, ["first", "second"])
         self.assertEqual(sorted(seen), [(0, "first"), (1, "second")])
+
+    def test_shard_progress_tracks_reused_and_rebuilt_counts(self) -> None:
+        progress = init_shard_progress(phase="calling_shards", total_shards=3, score_hash="abc")
+        record_shard_completion(progress, shard_name="chr1", reused=True)
+        record_shard_completion(progress, shard_name="chr2", reused=False)
+        self.assertEqual(progress["completed_shards"], 2)
+        self.assertEqual(progress["pending_shards"], 1)
+        self.assertEqual(progress["reused_completed_shards"], 1)
+        self.assertEqual(progress["rebuilt_completed_shards"], 1)
+        self.assertEqual(progress["last_completed_shard"], "chr2")
 
 
 if __name__ == "__main__":

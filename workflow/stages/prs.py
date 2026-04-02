@@ -17,9 +17,11 @@ from workflow.core.runtime import (
     ensure_dir,
     ensure_docker_ready,
     hash_strings,
+    init_shard_progress,
     load_json,
     parse_memory_to_mb,
     plan_worker_pool,
+    record_shard_completion,
     remove_if_exists,
     run_command,
     run_tasks_in_parallel,
@@ -302,15 +304,18 @@ def build_dense_prs_shard(
     sample_id: str,
     pairhmm_threads: int,
     java_memory: str,
-) -> str:
+) -> dict[str, Any]:
     shard_dir = ensure_dir(stage_root / "dense" / "shards" / shard["name"])
     log_dir = ensure_dir(stage_root / "logs")
     shard_targets = shard_dir / f"{shard['name']}.targets.vcf.gz"
     gvcf = shard_dir / f"{sample_id}.{shard['name']}.g.vcf.gz"
     dense_vcf = shard_dir / f"{sample_id}.{shard['name']}.dense.vcf.gz"
     region_arg = ",".join(shard["intervals"])
+    shard_targets_reused = complete_artifact(shard_targets)
+    gvcf_reused = complete_artifact(gvcf)
+    dense_vcf_reused = complete_artifact(dense_vcf)
 
-    if not complete_artifact(shard_targets):
+    if not shard_targets_reused:
         remove_if_exists(shard_targets, f"{shard_targets}.tbi")
         run_command(
             ["bcftools", "view", "-r", region_arg, "-Oz", "-o", str(shard_targets), str(targets_vcf)],
@@ -323,7 +328,7 @@ def build_dense_prs_shard(
             log_path=log_dir / f"{shard['name']}.targets.index.log",
         )
 
-    if not complete_artifact(gvcf):
+    if not gvcf_reused:
         remove_if_exists(gvcf, f"{gvcf}.tbi")
         run_command(
             build_docker_run_command(
@@ -351,7 +356,7 @@ def build_dense_prs_shard(
             log_path=log_dir / f"{shard['name']}.haplotypecaller.log",
         )
 
-    if not complete_artifact(dense_vcf):
+    if not dense_vcf_reused:
         remove_if_exists(dense_vcf, f"{dense_vcf}.tbi")
         run_command(
             build_docker_run_command(
@@ -377,7 +382,16 @@ def build_dense_prs_shard(
             check=True,
             log_path=log_dir / f"{shard['name']}.genotypegvcfs.log",
         )
-    return str(dense_vcf)
+    return {
+        "shard_name": shard["name"],
+        "dense_vcf": str(dense_vcf),
+        "gvcf": str(gvcf),
+        "targets_vcf": str(shard_targets),
+        "reused": dense_vcf_reused,
+        "reused_targets_vcf": shard_targets_reused,
+        "reused_gvcf": gvcf_reused,
+        "reused_dense_vcf": dense_vcf_reused,
+    }
 
 
 def concat_dense_vcf(stage_root: pathlib.Path, reference_fasta: pathlib.Path, sample_id: str, dense_shards: list[str]) -> str:
@@ -681,14 +695,11 @@ def main() -> None:
                     free_gb=context["disk"].get("free_gb"),
                     min_free_gb=context["disk"].get("min_free_gb"),
                 )
-                progress = {
-                    "phase": "building_dense_genotypes",
-                    "score_hash": score_hash,
-                    "total_shards": len(shards),
-                    "completed_shards": 0,
-                    "pending_shards": len(shards),
-                    "completed_shard_names": [],
-                }
+                progress = init_shard_progress(
+                    phase="building_dense_genotypes",
+                    total_shards=len(shards),
+                    score_hash=score_hash,
+                )
                 dense_info = stage_payload(
                     "prs_dense_genotypes",
                     "running",
@@ -720,21 +731,18 @@ def main() -> None:
                 ]
                 shard_names = [shard["name"] for shard in shards]
 
-                def on_shard_complete(index: int, _result: Any) -> None:
+                def on_shard_complete(index: int, result: Any) -> None:
                     assert progress is not None
-                    shard_name = shard_names[index]
-                    completed = progress["completed_shard_names"]
-                    if shard_name not in completed:
-                        completed.append(shard_name)
-                    progress["completed_shards"] = len(completed)
-                    progress["pending_shards"] = len(shards) - len(completed)
-                    progress["last_completed_shard"] = shard_name
+                    shard_name = result.get("shard_name") or shard_names[index]
+                    record_shard_completion(progress, shard_name=shard_name, reused=bool(result.get("reused")))
                     write_live_status("running", phase="building_dense_genotypes")
 
-                dense_shards = run_tasks_in_parallel(tasks, max_workers=worker_plan["workers"], on_complete=on_shard_complete)
+                shard_results = run_tasks_in_parallel(tasks, max_workers=worker_plan["workers"], on_complete=on_shard_complete)
+                dense_shards = [str(item["dense_vcf"]) for item in shard_results]
                 progress = {
                     **(progress or {}),
                     "phase": "concatenating_dense_vcf",
+                    "reused_dense_shards": sum(1 for item in shard_results if item.get("reused")),
                 }
                 write_live_status("running", phase="concatenating_dense_vcf")
                 dense_vcf_path = concat_dense_vcf(dense_root, reference_fasta, context["sample_id"], dense_shards)
@@ -831,6 +839,7 @@ def main() -> None:
             input_fingerprint_id=context["input_fingerprint"]["id"],
             reused=False,
             dense_genotypes=dense_info,
+            progress=progress,
             summary={
                 "num_requested_scores": len(cfg["pgs_ids"]),
                 "union_sites": (dense_info.get("summary") or {}).get("union_sites"),

@@ -315,6 +315,34 @@ def plan_contig_shards(contigs: Iterable[str], prefix: str) -> list[dict[str, An
     return shards
 
 
+def init_shard_progress(*, phase: str, total_shards: int, **extra: Any) -> dict[str, Any]:
+    progress = {
+        "phase": phase,
+        "total_shards": int(total_shards),
+        "completed_shards": 0,
+        "pending_shards": int(total_shards),
+        "reused_completed_shards": 0,
+        "rebuilt_completed_shards": 0,
+        "completed_shard_names": [],
+    }
+    progress.update(extra)
+    return progress
+
+
+def record_shard_completion(progress: dict[str, Any], *, shard_name: str, reused: bool) -> dict[str, Any]:
+    completed = progress.setdefault("completed_shard_names", [])
+    if shard_name not in completed:
+        completed.append(shard_name)
+        progress["completed_shards"] = len(completed)
+        progress["pending_shards"] = max(0, int(progress.get("total_shards", len(completed))) - len(completed))
+        if reused:
+            progress["reused_completed_shards"] = int(progress.get("reused_completed_shards", 0)) + 1
+        else:
+            progress["rebuilt_completed_shards"] = int(progress.get("rebuilt_completed_shards", 0)) + 1
+    progress["last_completed_shard"] = shard_name
+    return progress
+
+
 def ensure_docker_ready(docker_bin: str) -> None:
     completed = run_command([docker_bin, "version", "--format", "{{.Server.Version}}"], check=False)
     if completed.returncode == 0:

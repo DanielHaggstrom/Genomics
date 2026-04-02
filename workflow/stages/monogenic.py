@@ -15,8 +15,10 @@ from workflow.core.runtime import (
     complete_artifact,
     ensure_dir,
     ensure_docker_ready,
+    init_shard_progress,
     load_json,
     plan_worker_pool,
+    record_shard_completion,
     remove_if_exists,
     run_command,
     run_tasks_in_parallel,
@@ -500,14 +502,16 @@ def call_monogenic_shard(
     sample_id: str,
     pairhmm_threads: int,
     java_memory: str,
-) -> str:
+) -> dict[str, Any]:
     shard_dir = ensure_dir(stage_root / "shards" / shard["name"])
     log_dir = ensure_dir(stage_root / "logs")
     gvcf = shard_dir / f"{sample_id}.{shard['name']}.g.vcf.gz"
     raw_vcf = shard_dir / f"{sample_id}.{shard['name']}.raw.vcf.gz"
     interval_args = [item for interval in shard["intervals"] for item in ("-L", interval)]
+    gvcf_reused = complete_artifact(gvcf)
+    raw_vcf_reused = complete_artifact(raw_vcf)
 
-    if not complete_artifact(gvcf):
+    if not gvcf_reused:
         remove_if_exists(gvcf, f"{gvcf}.tbi")
         run_command(
             build_gatk_command(
@@ -533,7 +537,7 @@ def call_monogenic_shard(
             log_path=log_dir / f"{shard['name']}.haplotypecaller.log",
         )
 
-    if not complete_artifact(raw_vcf):
+    if not raw_vcf_reused:
         remove_if_exists(raw_vcf, f"{raw_vcf}.tbi")
         run_command(
             build_gatk_command(
@@ -557,7 +561,14 @@ def call_monogenic_shard(
             log_path=log_dir / f"{shard['name']}.genotypegvcfs.log",
         )
 
-    return str(raw_vcf)
+    return {
+        "shard_name": shard["name"],
+        "raw_vcf": str(raw_vcf),
+        "gvcf": str(gvcf),
+        "reused": raw_vcf_reused,
+        "reused_gvcf": gvcf_reused,
+        "reused_raw_vcf": raw_vcf_reused,
+    }
 
 
 def concat_and_filter_monogenic(stage_root: pathlib.Path, reference_fasta: pathlib.Path, sample_id: str, shard_vcfs: list[str], docker_bin: str) -> tuple[str, str]:
@@ -886,13 +897,7 @@ def main() -> None:
                     free_gb=context["disk"].get("free_gb"),
                     min_free_gb=context["disk"].get("min_free_gb"),
                 )
-                progress = {
-                    "phase": "calling_shards",
-                    "total_shards": len(shards),
-                    "completed_shards": 0,
-                    "pending_shards": len(shards),
-                    "completed_shard_names": [],
-                }
+                progress = init_shard_progress(phase="calling_shards", total_shards=len(shards))
                 write_stage_status("running", phase="calling_shards")
 
                 tasks = [
@@ -912,22 +917,19 @@ def main() -> None:
                 ]
                 shard_names = [shard["name"] for shard in shards]
 
-                def on_shard_complete(index: int, _result: Any) -> None:
+                def on_shard_complete(index: int, result: Any) -> None:
                     assert progress is not None
-                    shard_name = shard_names[index]
-                    completed = progress["completed_shard_names"]
-                    if shard_name not in completed:
-                        completed.append(shard_name)
-                    progress["completed_shards"] = len(completed)
-                    progress["pending_shards"] = len(shards) - len(completed)
-                    progress["last_completed_shard"] = shard_name
+                    shard_name = result.get("shard_name") or shard_names[index]
+                    record_shard_completion(progress, shard_name=shard_name, reused=bool(result.get("reused")))
                     write_stage_status("running", phase="calling_shards")
 
-                shard_vcfs = run_tasks_in_parallel(tasks, max_workers=worker_plan["workers"], on_complete=on_shard_complete)
+                shard_results = run_tasks_in_parallel(tasks, max_workers=worker_plan["workers"], on_complete=on_shard_complete)
+                shard_vcfs = [str(item["raw_vcf"]) for item in shard_results]
                 progress = {
                     **(progress or {}),
                     "phase": "concat_and_filter",
                     "raw_shard_vcf_count": len(shard_vcfs),
+                    "reused_raw_shard_vcfs": sum(1 for item in shard_results if item.get("reused")),
                 }
                 write_stage_status("running", phase="concat_and_filter")
                 _, filtered_vcf_path = concat_and_filter_monogenic(stage_root, reference_fasta, sample_id, shard_vcfs, docker_bin)
@@ -974,6 +976,7 @@ def main() -> None:
             source_mode=source_mode,
             import_details=import_details,
             worker_plan=worker_plan if not called_vcf and not annotated_vcf_import else None,
+            progress=progress,
             summary=summary,
             artifacts={
                 "annotated_vcf": str(annotated_vcf),
