@@ -129,6 +129,11 @@ class RenderReportTests(unittest.TestCase):
                 "imputed_genotypes": {
                     "status": "ok",
                     "source_mode": "import_imputed_prs_vcf",
+                    "summary": {
+                        "backend": "beagle",
+                        "panel_id": "grch38_beagle_panel",
+                        "info_threshold": 0.8,
+                    },
                     "import_details": {
                         "provenance": "external_import",
                         "source": "/external/imputed.vcf.gz",
@@ -215,6 +220,8 @@ class RenderReportTests(unittest.TestCase):
             self.assertIn("Import stage manifest: `/external/annotated.stage_manifest.json`", report_text)
             self.assertIn("Dense genotype import note: external import without repo-generated stage manifest", report_text)
             self.assertIn(f"Imputed PRS VCF: `{tmp / 'cache' / 'imputed.vcf.gz'}`", report_text)
+            self.assertIn("Imputation backend: `beagle`", report_text)
+            self.assertIn("Imputation panel: `grch38_beagle_panel`", report_text)
             self.assertIn("Imputed genotype import note: external import without repo-generated stage manifest", report_text)
             self.assertIn(f"Match diagnostics JSON: `{tmp / 'cache' / 'match_diagnostics.json'}`", report_text)
             self.assertTrue((results_dir / "monogenic" / "annotated.vcf.gz").exists())

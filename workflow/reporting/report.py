@@ -276,6 +276,13 @@ def render_report(
             if prs_imputed:
                 out.write(f"- Imputed genotype stage status: `{prs_imputed.get('status', 'unknown')}`\n")
                 render_import_details(out, prs_imputed.get("import_details"), prefix="Imputed genotype import")
+                imputed_summary = prs_imputed.get("summary") or {}
+                if imputed_summary.get("backend"):
+                    out.write(f"- Imputation backend: `{imputed_summary['backend']}`\n")
+                if imputed_summary.get("panel_id"):
+                    out.write(f"- Imputation panel: `{imputed_summary['panel_id']}`\n")
+                if imputed_summary.get("info_threshold") is not None:
+                    out.write(f"- Imputation INFO threshold: `{imputed_summary['info_threshold']}`\n")
                 imputed_artifacts = prs_imputed.get("artifacts") or {}
                 if imputed_artifacts.get("imputed_vcf"):
                     out.write(f"- Imputed PRS VCF: `{imputed_artifacts['imputed_vcf']}`\n")

@@ -138,7 +138,11 @@ The default behavior is to use the automatic planner and only set those fields w
 PRS imputation is now an explicit compatibility surface:
 - `analysis.prs.imputation.enabled: true` signals that PRS should use an imputation-compatible path
 - `reuse.imputed_prs_vcf` lets you score a precomputed imputed PRS VCF as a stage-boundary import
-- the local Beagle/reference-panel backend is still the next implementation step; for now, enabling imputation without providing an imported imputed VCF will fail fast with a clear message instead of silently falling back
+- the local backend now expects `analysis.prs.imputation.reference_panel` to point at a panel manifest ID or YAML path
+- the first local backend is a single-sample Beagle path against a per-chromosome phased reference panel
+- because this repo is single-sample, the first local backend does not run `conform-gt`; the official `conform-gt` docs say its statistical strand checks require at least 20 target samples
+- tracked example panel manifests live under `manifests/examples/imputation_panels/`
+- local panel manifests belong under ignored `manifests/local/imputation_panels/`
 
 Tracked example presets live in:
 - `manifests/examples/score_presets.yaml`
@@ -159,6 +163,7 @@ Optional remote MD5 decode probing is available for diagnostics, but it does not
 
 Tracked example:
 - `manifests/examples/reference_bundles/grch38_dragen_alt_masked.yaml`
+- `manifests/examples/imputation_panels/grch38_beagle_panel.yaml`
 
 ## Outputs
 

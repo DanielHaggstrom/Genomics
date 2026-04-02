@@ -8,9 +8,10 @@ import json
 import pathlib
 import re
 import urllib.request
-from typing import Any
+from typing import Any, Callable
 
 from workflow.core.runtime import (
+    REPO_ROOT,
     build_docker_run_command,
     complete_artifact,
     complete_artifacts_exist,
@@ -19,12 +20,17 @@ from workflow.core.runtime import (
     hash_strings,
     init_shard_progress,
     load_json,
+    load_yaml,
+    normalize_path,
+    needs_staging,
     parse_memory_to_mb,
     plan_worker_pool,
     record_shard_completion,
     remove_if_exists,
     run_command,
     run_tasks_in_parallel,
+    sample_file_fingerprint,
+    stage_file,
     stage_payload,
     write_json,
 )
@@ -32,8 +38,10 @@ from workflow.core.runtime import (
 
 STAGE_VERSION = 7
 UNION_SITE_VERSION = 3
+IMPUTATION_STAGE_VERSION = 1
 GATK_IMAGE = "broadinstitute/gatk:4.6.1.0"
 PLINK2_IMAGE = "ghcr.io/pgscatalog/plink2:2.00a5.10"
+BEAGLE_URL = "https://faculty.washington.edu/browning/beagle/beagle.29Oct24.c8e.jar"
 OVERLAP_RE = re.compile(r"Score (\S+) fails minimum matching threshold \(([\d.]+)% variants match\)")
 BASE_COMPLEMENTS = {
     "A": "T",
@@ -238,6 +246,122 @@ def normalize_contig(raw: str, prefix: str) -> str:
     if not prefix and raw.startswith("chr"):
         return raw[3:]
     return raw
+
+
+def base_contig_name(contig: str, prefix: str) -> str:
+    if prefix == "chr" and contig.startswith("chr"):
+        return contig[3:]
+    return contig
+
+
+def is_manifest_path(raw: str) -> bool:
+    return any(token in raw for token in ("/", "\\")) or raw.endswith(".yaml")
+
+
+def resolve_imputation_panel_manifest_path(context: dict[str, Any]) -> pathlib.Path:
+    manifest_path = pathlib.Path(context["manifest_path"])
+    panel_ref = ((context["manifest"]["analysis"]["prs"].get("imputation") or {}).get("reference_panel") or "").strip()
+    if not panel_ref:
+        raise RuntimeError("analysis.prs.imputation.reference_panel is required when PRS imputation is enabled.")
+
+    if is_manifest_path(panel_ref):
+        candidate = pathlib.Path(normalize_path(panel_ref, base_dir=manifest_path.parent))
+        if candidate.exists():
+            return candidate
+        raise RuntimeError(f"Imputation panel manifest not found: {candidate}")
+
+    candidates = [
+        manifest_path.parent / "imputation_panels" / f"{panel_ref}.yaml",
+        REPO_ROOT / "manifests" / "local" / "imputation_panels" / f"{panel_ref}.yaml",
+        REPO_ROOT / "manifests" / "examples" / "imputation_panels" / f"{panel_ref}.yaml",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise RuntimeError(f"No imputation panel manifest found for reference_panel={panel_ref}")
+
+
+def infer_panel_index_path(path: pathlib.Path) -> pathlib.Path | None:
+    candidates = [pathlib.Path(str(path) + ".tbi"), pathlib.Path(str(path) + ".csi")]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def ensure_staged_path(source: pathlib.Path, destination_dir: pathlib.Path, linux_cache_root: pathlib.Path) -> pathlib.Path:
+    if needs_staging(source, linux_cache_root):
+        fingerprint = sample_file_fingerprint(source)
+        return pathlib.Path(stage_file(source, destination_dir, fingerprint=fingerprint))
+    return source
+
+
+def load_imputation_panel(context: dict[str, Any]) -> dict[str, Any]:
+    manifest_path = resolve_imputation_panel_manifest_path(context)
+    panel = load_yaml(manifest_path) or {}
+    if not isinstance(panel, dict):
+        raise RuntimeError(f"Imputation panel manifest must be a YAML object: {manifest_path}")
+
+    build = str(panel.get("build") or "").strip()
+    if build and build != context["manifest"]["reference"]["build"]:
+        raise RuntimeError(
+            f"Imputation panel build mismatch: panel={build} manifest={context['manifest']['reference']['build']}"
+        )
+
+    chrom_vcf_pattern = panel.get("chrom_vcf_pattern")
+    if not chrom_vcf_pattern:
+        raise RuntimeError(f"Imputation panel manifest is missing chrom_vcf_pattern: {manifest_path}")
+
+    panel_prefix = str(panel.get("contig_prefix") or context["contig_prefix"] or "")
+    chromosomes = [str(item) for item in (panel.get("chromosomes") or [str(i) for i in range(1, 23)] + ["X"])]
+    base_chromosomes = sorted({base_contig_name(item, panel_prefix) for item in chromosomes})
+
+    normalized_pattern = normalize_path(chrom_vcf_pattern, base_dir=manifest_path.parent)
+    map_pattern = panel.get("map_pattern")
+    normalized_map = normalize_path(map_pattern, base_dir=manifest_path.parent) if map_pattern else None
+
+    return {
+        "panel_id": str(panel.get("panel_id") or manifest_path.stem),
+        "manifest_path": str(manifest_path),
+        "manifest_fingerprint_id": sample_file_fingerprint(manifest_path)["id"],
+        "build": context["manifest"]["reference"]["build"],
+        "contig_prefix": panel_prefix,
+        "chrom_vcf_pattern": normalized_pattern,
+        "map_pattern": normalized_map,
+        "chromosomes": chromosomes,
+        "base_chromosomes": base_chromosomes,
+    }
+
+
+def resolve_panel_resources_for_contig(panel: dict[str, Any], *, contig: str, target_prefix: str) -> dict[str, Any] | None:
+    base_chrom = base_contig_name(contig, target_prefix)
+    if base_chrom not in set(panel["base_chromosomes"]):
+        return None
+
+    panel_chrom = normalize_contig(base_chrom, panel["contig_prefix"])
+    format_vars = {
+        "chrom": panel_chrom,
+        "base_chrom": base_chrom,
+        "chrom_no_prefix": base_chrom,
+    }
+    vcf_path = pathlib.Path(panel["chrom_vcf_pattern"].format(**format_vars))
+    map_pattern = panel.get("map_pattern")
+    map_path = pathlib.Path(map_pattern.format(**format_vars)) if map_pattern else None
+    return {
+        "base_chrom": base_chrom,
+        "panel_chrom": panel_chrom,
+        "vcf": vcf_path,
+        "map": map_path,
+    }
+
+
+def ensure_beagle_jar(tool_cache_root: pathlib.Path) -> pathlib.Path:
+    beagle_root = ensure_dir(tool_cache_root / "beagle")
+    jar_path = beagle_root / pathlib.Path(BEAGLE_URL).name
+    if jar_path.exists():
+        return jar_path
+    urllib.request.urlretrieve(BEAGLE_URL, jar_path)
+    return jar_path
 
 
 def parse_base_tokens(raw: str | None) -> set[str]:
@@ -706,6 +830,450 @@ def concat_dense_vcf(stage_root: pathlib.Path, reference_fasta: pathlib.Path, sa
     return str(final_vcf)
 
 
+def filter_imputed_expression(info_threshold: float) -> str:
+    return f"(INFO/IMP=1 && INFO/DR2>={info_threshold}) || INFO/IMP=0"
+
+
+def build_imputation_shards(context: dict[str, Any], dense_vcf: pathlib.Path, panel: dict[str, Any]) -> list[dict[str, Any]]:
+    dense_contigs = [line.strip() for line in run_command(["tabix", "-l", str(dense_vcf)], check=True).stdout.splitlines() if line.strip()]
+    shards = []
+    for shard in context["shards"]["prs"]:
+        shard_contigs = [contig for contig in shard["intervals"] if contig in dense_contigs]
+        if not shard_contigs:
+            continue
+        panel_resources = [resolve_panel_resources_for_contig(panel, contig=contig, target_prefix=context["contig_prefix"]) for contig in shard_contigs]
+        imputation_mode = "impute" if all(panel_resources) else "passthrough"
+        if imputation_mode == "impute":
+            base_chroms = sorted({resource["base_chrom"] for resource in panel_resources if resource})
+            if len(base_chroms) != 1:
+                raise RuntimeError(f"Imputation shard {shard['name']} spans multiple panel chromosomes: {base_chroms}")
+            panel_resource = panel_resources[0]
+        else:
+            panel_resource = None
+        shards.append({**shard, "intervals": shard_contigs, "imputation_mode": imputation_mode, "panel_resource": panel_resource})
+    return shards
+
+
+def stage_panel_resources(panel_resource: dict[str, Any], *, stage_root: pathlib.Path, linux_cache_root: pathlib.Path) -> dict[str, pathlib.Path]:
+    panel_dir = ensure_dir(stage_root / "panel_cache" / panel_resource["base_chrom"])
+    panel_vcf = pathlib.Path(panel_resource["vcf"])
+    if not panel_vcf.exists():
+        raise RuntimeError(f"Imputation panel VCF not found: {panel_vcf}")
+
+    panel_index = infer_panel_index_path(panel_vcf)
+    if panel_index is None:
+        raise RuntimeError(f"Imputation panel VCF is missing a tabix/csi index: {panel_vcf}")
+
+    staged_vcf = ensure_staged_path(panel_vcf, panel_dir, linux_cache_root)
+    staged_index = ensure_staged_path(panel_index, panel_dir, linux_cache_root)
+
+    staged_map = None
+    map_path = panel_resource.get("map")
+    if map_path is not None:
+        map_target = pathlib.Path(map_path)
+        if not map_target.exists():
+            raise RuntimeError(f"Imputation genetic map not found: {map_target}")
+        staged_map = ensure_staged_path(map_target, panel_dir, linux_cache_root)
+
+    return {
+        "panel_vcf": staged_vcf,
+        "panel_index": staged_index,
+        "map": staged_map,
+    }
+
+
+def extract_dense_contig_vcf(
+    *,
+    dense_vcf: pathlib.Path,
+    shard_dir: pathlib.Path,
+    shard_name: str,
+    region_arg: str,
+) -> pathlib.Path:
+    target_vcf = shard_dir / f"{shard_name}.target.vcf.gz"
+    if complete_artifact(target_vcf):
+        return target_vcf
+
+    remove_if_exists(target_vcf, f"{target_vcf}.tbi")
+    run_command(
+        ["bcftools", "view", "-r", region_arg, "-Oz", "-o", str(target_vcf), str(dense_vcf)],
+        check=True,
+        log_path=shard_dir / f"{shard_name}.target.extract.log",
+    )
+    run_command(
+        ["tabix", "-f", "-p", "vcf", str(target_vcf)],
+        check=True,
+        log_path=shard_dir / f"{shard_name}.target.extract.index.log",
+    )
+    return target_vcf
+
+
+def rename_contig_for_panel(
+    *,
+    input_vcf: pathlib.Path,
+    shard_dir: pathlib.Path,
+    shard_name: str,
+    source_contig: str,
+    target_contig: str,
+) -> pathlib.Path:
+    if source_contig == target_contig:
+        return input_vcf
+
+    renamed_vcf = shard_dir / f"{shard_name}.panel_target.vcf.gz"
+    if complete_artifact(renamed_vcf):
+        return renamed_vcf
+
+    rename_map = shard_dir / f"{shard_name}.rename.tsv"
+    rename_map.write_text(f"{source_contig}\t{target_contig}\n", encoding="utf-8")
+    remove_if_exists(renamed_vcf, f"{renamed_vcf}.tbi")
+    run_command(
+        ["bcftools", "annotate", "--rename-chrs", str(rename_map), "-Oz", "-o", str(renamed_vcf), str(input_vcf)],
+        check=True,
+        log_path=shard_dir / f"{shard_name}.rename.log",
+    )
+    run_command(
+        ["tabix", "-f", "-p", "vcf", str(renamed_vcf)],
+        check=True,
+        log_path=shard_dir / f"{shard_name}.rename.index.log",
+    )
+    return renamed_vcf
+
+
+def finalize_imputed_vcf(
+    *,
+    input_vcf: pathlib.Path,
+    shard_dir: pathlib.Path,
+    shard_name: str,
+    reference_fasta: pathlib.Path,
+    info_threshold: float,
+    output_name: str,
+) -> pathlib.Path:
+    norm_vcf = shard_dir / f"{shard_name}.imputed.norm.vcf.gz"
+    if not complete_artifact(norm_vcf):
+        remove_if_exists(norm_vcf, f"{norm_vcf}.tbi")
+        run_command(
+            ["bcftools", "norm", "-f", str(reference_fasta), "-m", "-both", "-Oz", "-o", str(norm_vcf), str(input_vcf)],
+            check=True,
+            log_path=shard_dir / f"{shard_name}.norm.log",
+        )
+        run_command(
+            ["tabix", "-f", "-p", "vcf", str(norm_vcf)],
+            check=True,
+            log_path=shard_dir / f"{shard_name}.norm.index.log",
+        )
+
+    final_vcf = shard_dir / output_name
+    if not complete_artifact(final_vcf):
+        remove_if_exists(final_vcf, f"{final_vcf}.tbi")
+        run_command(
+            ["bcftools", "view", "-i", filter_imputed_expression(info_threshold), "-Oz", "-o", str(final_vcf), str(norm_vcf)],
+            check=True,
+            log_path=shard_dir / f"{shard_name}.filter.log",
+        )
+        run_command(
+            ["tabix", "-f", "-p", "vcf", str(final_vcf)],
+            check=True,
+            log_path=shard_dir / f"{shard_name}.filter.index.log",
+        )
+    return final_vcf
+
+
+def build_imputed_prs_shard(
+    *,
+    context: dict[str, Any],
+    stage_root: pathlib.Path,
+    dense_vcf: pathlib.Path,
+    reference_fasta: pathlib.Path,
+    shard: dict[str, Any],
+    panel: dict[str, Any],
+    beagle_jar: pathlib.Path,
+    java_memory: str,
+    beagle_threads: int,
+    info_threshold: float,
+) -> dict[str, Any]:
+    shard_dir = ensure_dir(stage_root / "shards" / shard["name"])
+    region_arg = ",".join(shard["intervals"])
+
+    if shard["imputation_mode"] == "passthrough":
+        passthrough_vcf = shard_dir / f"{context['sample_id']}.{shard['name']}.dense_passthrough.vcf.gz"
+        passthrough_reused = complete_artifact(passthrough_vcf)
+        if not passthrough_reused:
+            remove_if_exists(passthrough_vcf, f"{passthrough_vcf}.tbi")
+            run_command(
+                ["bcftools", "view", "-r", region_arg, "-Oz", "-o", str(passthrough_vcf), str(dense_vcf)],
+                check=True,
+                log_path=shard_dir / f"{shard['name']}.passthrough.log",
+            )
+            run_command(
+                ["tabix", "-f", "-p", "vcf", str(passthrough_vcf)],
+                check=True,
+                log_path=shard_dir / f"{shard['name']}.passthrough.index.log",
+            )
+        return {
+            "shard_name": shard["name"],
+            "mode": "passthrough",
+            "output_vcf": str(passthrough_vcf),
+            "reused": passthrough_reused,
+            "panel_chrom": None,
+        }
+
+    final_vcf = shard_dir / f"{context['sample_id']}.{shard['name']}.imputed.filtered.vcf.gz"
+    if complete_artifact(final_vcf):
+        return {
+            "shard_name": shard["name"],
+            "mode": "imputed",
+            "output_vcf": str(final_vcf),
+            "reused": True,
+            "panel_chrom": shard["panel_resource"]["panel_chrom"],
+        }
+
+    target_vcf = extract_dense_contig_vcf(
+        dense_vcf=dense_vcf,
+        shard_dir=shard_dir,
+        shard_name=shard["name"],
+        region_arg=region_arg,
+    )
+    target_input = rename_contig_for_panel(
+        input_vcf=target_vcf,
+        shard_dir=shard_dir,
+        shard_name=shard["name"],
+        source_contig=shard["intervals"][0],
+        target_contig=shard["panel_resource"]["panel_chrom"],
+    )
+    panel_resources = stage_panel_resources(
+        shard["panel_resource"],
+        stage_root=stage_root,
+        linux_cache_root=pathlib.Path(context["runtime"]["linux_cache_root"]),
+    )
+    beagle_out_prefix = shard_dir / f"{context['sample_id']}.{shard['name']}.beagle"
+    beagle_vcf = pathlib.Path(str(beagle_out_prefix) + ".vcf.gz")
+    if not beagle_vcf.exists():
+        remove_if_exists(beagle_vcf, shard_dir / f"{beagle_out_prefix.name}.log")
+        args = [
+            "java",
+            f"-Xmx{java_memory}",
+            "-jar",
+            str(beagle_jar),
+            f"gt={target_input}",
+            f"ref={panel_resources['panel_vcf']}",
+            f"out={beagle_out_prefix}",
+            f"chrom={shard['panel_resource']['panel_chrom']}",
+            f"nthreads={beagle_threads}",
+        ]
+        if panel_resources["map"] is not None:
+            args.append(f"map={panel_resources['map']}")
+        run_command(
+            args,
+            check=True,
+            log_path=shard_dir / f"{shard['name']}.beagle.log",
+        )
+
+    renamed_back = rename_contig_for_panel(
+        input_vcf=beagle_vcf,
+        shard_dir=shard_dir,
+        shard_name=f"{shard['name']}.restore",
+        source_contig=shard["panel_resource"]["panel_chrom"],
+        target_contig=shard["intervals"][0],
+    )
+    final_vcf = finalize_imputed_vcf(
+        input_vcf=renamed_back,
+        shard_dir=shard_dir,
+        shard_name=shard["name"],
+        reference_fasta=reference_fasta,
+        info_threshold=info_threshold,
+        output_name=f"{context['sample_id']}.{shard['name']}.imputed.filtered.vcf.gz",
+    )
+    return {
+        "shard_name": shard["name"],
+        "mode": "imputed",
+        "output_vcf": str(final_vcf),
+        "reused": False,
+        "panel_chrom": shard["panel_resource"]["panel_chrom"],
+    }
+
+
+def concat_imputed_vcf(stage_root: pathlib.Path, sample_id: str, shard_vcfs: list[str]) -> str:
+    concat_vcf = stage_root / f"{sample_id}.imputed.concat.vcf.gz"
+    final_vcf = stage_root / f"{sample_id}.imputed_prs.vcf.gz"
+    if not complete_artifact(concat_vcf):
+        remove_if_exists(concat_vcf, f"{concat_vcf}.tbi")
+        run_command(
+            ["bcftools", "concat", "-a", "-Oz", "-o", str(concat_vcf), *shard_vcfs],
+            check=True,
+            log_path=stage_root / "concat.log",
+        )
+        run_command(
+            ["tabix", "-f", "-p", "vcf", str(concat_vcf)],
+            check=True,
+            log_path=stage_root / "concat.index.log",
+        )
+    if not complete_artifact(final_vcf):
+        remove_if_exists(final_vcf, f"{final_vcf}.tbi")
+        run_command(
+            ["bcftools", "sort", "-Oz", "-o", str(final_vcf), str(concat_vcf)],
+            check=True,
+            log_path=stage_root / "sort.log",
+        )
+        run_command(
+            ["tabix", "-f", "-p", "vcf", str(final_vcf)],
+            check=True,
+            log_path=stage_root / "sort.index.log",
+        )
+    return str(final_vcf)
+
+
+def load_existing_imputation_stage(stage_manifest_path: pathlib.Path, cache_key: str) -> dict[str, Any] | None:
+    if not stage_manifest_path.exists():
+        return None
+    payload = load_json(stage_manifest_path)
+    if payload.get("cache_key") != cache_key or payload.get("status") != "ok":
+        return None
+    artifacts = payload.get("artifacts") or {}
+    if not complete_artifacts_exist([artifacts.get("imputed_vcf")]):
+        return None
+    payload["reused"] = True
+    return payload
+
+
+def build_or_reuse_imputed_vcf(
+    *,
+    context: dict[str, Any],
+    stage_root: pathlib.Path,
+    dense_info: dict[str, Any],
+    score_hash: str,
+    reference_fasta: pathlib.Path,
+    update_status: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    imputation_cfg = context["manifest"]["analysis"]["prs"].get("imputation") or {}
+    panel = load_imputation_panel(context)
+    imputation_root = ensure_dir(stage_root / score_hash / "imputation" / panel["panel_id"])
+    stage_manifest_path = imputation_root / "stage_manifest.json"
+    cache_key = hash_strings(
+        [
+            f"v{STAGE_VERSION}",
+            f"imputation-v{IMPUTATION_STAGE_VERSION}",
+            context["input_fingerprint"]["id"],
+            score_hash,
+            panel["panel_id"],
+            panel["manifest_path"],
+            panel["manifest_fingerprint_id"],
+            str(imputation_cfg.get("info_threshold")),
+            str(imputation_cfg.get("backend")),
+        ]
+    )
+    existing = load_existing_imputation_stage(stage_manifest_path, cache_key)
+    if existing is not None:
+        return existing, {"phase": "scoring_reused_imputed_vcf", "score_hash": score_hash}
+
+    beagle_jar = ensure_beagle_jar(pathlib.Path(context["runtime"]["tool_cache_root"]))
+    dense_vcf = pathlib.Path(dense_info["artifacts"]["dense_vcf"])
+    shards = build_imputation_shards(context, dense_vcf, panel)
+    worker_plan = plan_worker_pool(
+        stage_name="prs_imputation",
+        shard_count=len(shards),
+        max_cpus=int(context["manifest"]["runtime"]["max_cpus"]),
+        max_memory=context["manifest"]["runtime"]["max_memory"],
+        requested_workers=context["manifest"]["analysis"]["prs"].get("workers"),
+        requested_pairhmm_threads=context["manifest"]["analysis"]["prs"].get("pairhmm_threads"),
+        default_worker_cap=6,
+        default_pairhmm_cap=2,
+        min_memory_per_worker_gb=2.5,
+        free_gb=context["disk"].get("free_gb"),
+        min_free_gb=context["disk"].get("min_free_gb"),
+    )
+    progress = init_shard_progress(
+        phase="imputing_dense_vcf",
+        total_shards=len(shards),
+        score_hash=score_hash,
+    )
+    running_payload = stage_payload(
+        "prs_imputed_genotypes",
+        "running",
+        cache_key=cache_key,
+        score_hash=score_hash,
+        worker_plan=worker_plan,
+        summary={
+            "backend": imputation_cfg.get("backend"),
+            "panel_id": panel["panel_id"],
+            "info_threshold": imputation_cfg.get("info_threshold"),
+            "target_shards": len(shards),
+        },
+        artifacts={
+            "panel_manifest": panel["manifest_path"],
+            "dense_vcf": dense_info["artifacts"]["dense_vcf"],
+            "dense_vcf_index": dense_info["artifacts"]["dense_vcf_index"],
+        },
+    )
+    if update_status is not None:
+        update_status(progress, running_payload)
+
+    tasks = [
+        (
+            lambda shard=shard: build_imputed_prs_shard(
+                context=context,
+                stage_root=imputation_root,
+                dense_vcf=dense_vcf,
+                reference_fasta=reference_fasta,
+                shard=shard,
+                panel=panel,
+                beagle_jar=beagle_jar,
+                java_memory=worker_plan["java_memory"],
+                beagle_threads=worker_plan["pairhmm_threads"],
+                info_threshold=float(imputation_cfg.get("info_threshold") or 0.8),
+            )
+        )
+        for shard in shards
+    ]
+    shard_names = [shard["name"] for shard in shards]
+
+    def on_complete(index: int, result: Any) -> None:
+        record_shard_completion(progress, shard_name=result.get("shard_name") or shard_names[index], reused=bool(result.get("reused")))
+        if update_status is not None:
+            update_status(progress, running_payload)
+
+    shard_results = run_tasks_in_parallel(tasks, max_workers=worker_plan["workers"], on_complete=on_complete)
+    imputed_outputs = [result["output_vcf"] for result in shard_results]
+    progress = {
+        **progress,
+        "phase": "concatenating_imputed_vcf",
+        "reused_imputed_shards": sum(1 for item in shard_results if item.get("reused")),
+        "imputed_shards": sum(1 for item in shard_results if item.get("mode") == "imputed"),
+        "passthrough_shards": sum(1 for item in shard_results if item.get("mode") == "passthrough"),
+    }
+    if update_status is not None:
+        update_status(progress, running_payload)
+
+    final_vcf = concat_imputed_vcf(imputation_root, context["sample_id"], imputed_outputs)
+    payload = stage_payload(
+        "prs_imputed_genotypes",
+        "ok",
+        cache_key=cache_key,
+        reused=False,
+        score_hash=score_hash,
+        worker_plan=worker_plan,
+        summary={
+            "backend": imputation_cfg.get("backend"),
+            "panel_id": panel["panel_id"],
+            "info_threshold": imputation_cfg.get("info_threshold"),
+            "target_shards": len(shards),
+            "imputed_shards": progress["imputed_shards"],
+            "passthrough_shards": progress["passthrough_shards"],
+        },
+        artifacts={
+            "panel_manifest": panel["manifest_path"],
+            "dense_vcf": dense_info["artifacts"]["dense_vcf"],
+            "dense_vcf_index": dense_info["artifacts"]["dense_vcf_index"],
+            "imputed_vcf": final_vcf,
+            "imputed_vcf_index": f"{final_vcf}.tbi",
+            "beagle_jar": str(beagle_jar),
+        },
+    )
+    write_json(stage_manifest_path, payload)
+    progress = {**progress, "phase": "scoring_imputed_vcf"}
+    if update_status is not None:
+        update_status(progress, payload)
+    return payload, progress
+
+
 def complete_pfile(prefix: pathlib.Path) -> bool:
     return complete_artifacts_exist(
         [
@@ -1114,25 +1682,21 @@ def main() -> None:
                 write_live_status("running", phase="scoring_dense_vcf")
 
             if imputation_cfg.get("enabled"):
-                payload = stage_payload(
-                    "prs",
-                    "failed",
-                    message=(
-                        "Local PRS imputation backend is not implemented yet. "
-                        "Provide reuse.imputed_prs_vcf to score an imputed PRS VCF, "
-                        "or disable analysis.prs.imputation.enabled to score the direct dense PRS VCF."
-                    ),
-                    dense_genotypes=dense_info,
-                    imputed_genotypes=stage_payload(
-                        "prs_imputed_genotypes",
-                        "failed",
-                        message="No imported imputed PRS VCF provided, and local imputation backend is not implemented yet.",
-                    ),
+                def update_imputation_status(current_progress: dict[str, Any], current_payload: dict[str, Any]) -> None:
+                    nonlocal progress, imputed_info
+                    progress = current_progress
+                    imputed_info = current_payload
+                    write_live_status("running", phase=current_progress.get("phase"))
+
+                imputed_info, progress = build_or_reuse_imputed_vcf(
+                    context=context,
+                    stage_root=stage_root,
+                    dense_info=dense_info,
+                    score_hash=score_hash,
+                    reference_fasta=reference_fasta,
+                    update_status=update_imputation_status,
                 )
-                write_json(stage_manifest_path, payload)
-                write_json(live_status_path, payload)
-                write_json(args.output, payload)
-                return
+                write_live_status("running", phase=(progress or {}).get("phase"))
 
         scoring_root = ensure_dir(stage_root / score_hash / "scoring")
         stage_manifest_path = scoring_root / "stage_manifest.json"
@@ -1141,7 +1705,11 @@ def main() -> None:
         scoring_input_path = scoring_input_artifacts.get("imputed_vcf") or scoring_input_artifacts.get("dense_vcf")
         scoring_input_index = scoring_input_artifacts.get("imputed_vcf_index") or scoring_input_artifacts.get("dense_vcf_index")
         scoring_input_kind = "imputed_vcf" if imputed_info else "dense_vcf"
-        scoring_input_fingerprint = (imported_imputed or imported_dense or {}).get("fingerprint", {}).get("id") or score_hash
+        scoring_input_fingerprint = (
+            (imported_imputed or imported_dense or {}).get("fingerprint", {}).get("id")
+            or (imputed_info or {}).get("cache_key")
+            or score_hash
+        )
         dosage_field = imputation_cfg.get("dosage_field") if imputed_info else None
         cache_key = ":".join(
             [

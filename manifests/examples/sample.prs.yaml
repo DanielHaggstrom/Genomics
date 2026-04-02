@@ -23,7 +23,7 @@ analysis:
     imputation:
       enabled: false
       backend: beagle
-      reference_panel: null
+      reference_panel: grch38_beagle_panel
       info_threshold: 0.8
       dosage_field: DS
 

@@ -5,11 +5,14 @@ from pathlib import Path
 import tempfile
 
 from workflow.stages.prs import (
+    base_contig_name,
     canonical_score_id,
     complement_base_tokens,
+    load_imputation_panel,
     parse_base_tokens,
     parse_overlap_diagnostics,
     plink_sex_code,
+    resolve_panel_resources_for_contig,
     resolve_cached_scorefile,
     resolve_score_row_alleles,
     resolve_score_row_alleles_for_site,
@@ -68,6 +71,10 @@ class PrsHelperTests(unittest.TestCase):
 
     def test_complement_base_tokens(self) -> None:
         self.assertEqual(complement_base_tokens({"A", "C"}), {"T", "G"})
+
+    def test_base_contig_name_strips_chr_prefix(self) -> None:
+        self.assertEqual(base_contig_name("chr7", "chr"), "7")
+        self.assertEqual(base_contig_name("7", ""), "7")
 
     def test_resolve_score_row_alleles_prefers_explicit_other_allele(self) -> None:
         resolved, reason = resolve_score_row_alleles(
@@ -224,6 +231,58 @@ class PrsHelperTests(unittest.TestCase):
         self.assertEqual(resolved["source"], "effect_allele_only")
         self.assertEqual(resolved["ref_allele"], "A")
         self.assertEqual(resolved["alts"], [])
+
+    def test_resolve_panel_resources_for_contig_uses_base_chromosome_placeholders(self) -> None:
+        panel = {
+            "contig_prefix": "",
+            "base_chromosomes": ["1", "2", "X"],
+            "chrom_vcf_pattern": "/ref/panel/{base_chrom}.vcf.gz",
+            "map_pattern": "/maps/plink.{base_chrom}.map",
+        }
+        resolved = resolve_panel_resources_for_contig(panel, contig="chr2", target_prefix="chr")
+        assert resolved is not None
+        self.assertEqual(str(resolved["vcf"]), "/ref/panel/2.vcf.gz")
+        self.assertEqual(str(resolved["map"]), "/maps/plink.2.map")
+        self.assertEqual(resolved["panel_chrom"], "2")
+
+    def test_load_imputation_panel_normalizes_patterns_and_chromosomes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            panel_dir = root / "imputation_panels"
+            panel_dir.mkdir()
+            panel_path = panel_dir / "demo.yaml"
+            panel_path.write_text(
+                "\n".join(
+                    [
+                        "panel_id: demo_panel",
+                        "build: GRCh38",
+                        "contig_prefix: ''",
+                        "chromosomes:",
+                        "  - 1",
+                        "  - X",
+                        "chrom_vcf_pattern: ./panel/chr{base_chrom}.vcf.gz",
+                        "map_pattern: ./maps/plink.{base_chrom}.map",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            manifest_path = root / "sample.yaml"
+            manifest_path.write_text("sample_id: DEMO\n", encoding="utf-8")
+            context = {
+                "manifest_path": str(manifest_path),
+                "manifest": {
+                    "reference": {"build": "GRCh38"},
+                    "analysis": {"prs": {"imputation": {"reference_panel": str(panel_path)}}},
+                },
+                "contig_prefix": "chr",
+            }
+
+            loaded = load_imputation_panel(context)
+            self.assertEqual(loaded["panel_id"], "demo_panel")
+            self.assertEqual(loaded["build"], "GRCh38")
+            self.assertEqual(loaded["base_chromosomes"], ["1", "X"])
+            self.assertTrue(str(panel_dir) in loaded["manifest_path"])
+            self.assertTrue(loaded["chrom_vcf_pattern"].endswith("/panel/chr{base_chrom}.vcf.gz"))
 
 
 if __name__ == "__main__":
