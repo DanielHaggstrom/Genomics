@@ -241,5 +241,6 @@ Guardrails for this cleanup phase:
 - Done: execution mode is now explicit and derived as `monogenic-only`, `prs-only`, or `both`, with tracked example manifests and report output that adapts to the selected mode.
 - Done: resource-aware worker planning is now implemented for monogenic and PRS dense-genotype stages, with optional narrow manifest overrides for workers and `pairhmm_threads`.
 - Done: cache-side shard progress now records reused vs rebuilt shard completions for monogenic and PRS dense genotyping.
+- Done: monogenic annotated-VCF / `CSQ` walking now flows through one shared iterator, with focused helper tests covering multiallelic carried-allele filtering and downstream priority/ClinVar selection.
 - In progress: PRS direct-from-WGS harmonization; scoring still fails the configured overlap threshold in the last measured run.
 - Next likely improvement: confirm completed shard reuse after interruption now that resume/visibility are easier to use, then decide whether any true live tuning support is worth adding.
