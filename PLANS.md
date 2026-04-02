@@ -243,5 +243,6 @@ Guardrails for this cleanup phase:
 - Done: cache-side shard progress now records reused vs rebuilt shard completions for monogenic and PRS dense genotyping.
 - Done: monogenic annotated-VCF / `CSQ` walking now flows through one shared iterator, with focused helper tests covering multiallelic carried-allele filtering and downstream priority/ClinVar selection.
 - Done: the final report now surfaces imported-artifact provenance, source paths, trust level, and source stage manifests more clearly for monogenic and PRS dense inputs.
+- Done: stage-level reuse checks are now stricter about complete artifacts, so cached VCF/BCF-style outputs must have their required inferred sidecars before a stage is treated as reusable.
 - In progress: PRS direct-from-WGS harmonization; scoring still fails the configured overlap threshold in the last measured run.
 - Next likely improvement: confirm completed shard reuse after interruption now that resume/visibility are easier to use, then decide whether any true live tuning support is worth adding.
