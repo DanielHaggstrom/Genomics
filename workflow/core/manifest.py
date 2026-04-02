@@ -41,6 +41,13 @@ PRS_DEFAULTS = {
     "sample_sex": None,
     "workers": None,
     "pairhmm_threads": None,
+    "imputation": {
+        "enabled": False,
+        "backend": "beagle",
+        "reference_panel": None,
+        "info_threshold": 0.8,
+        "dosage_field": "DS",
+    },
 }
 
 
@@ -86,6 +93,9 @@ def apply_defaults(manifest: dict[str, Any]) -> dict[str, Any]:
 
     prs = dict(PRS_DEFAULTS)
     prs.update(analysis.get("prs", {}) or {})
+    prs_imputation = dict(PRS_DEFAULTS["imputation"])
+    prs_imputation.update((analysis.get("prs", {}) or {}).get("imputation", {}) or {})
+    prs["imputation"] = prs_imputation
     analysis["prs"] = prs
 
     out["analysis"] = analysis

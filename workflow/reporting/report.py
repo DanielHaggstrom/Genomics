@@ -14,6 +14,8 @@ from workflow.core.runtime import ensure_dir, load_json, write_json
 
 def copy_file_if_needed(src: str, dst: pathlib.Path) -> None:
     src_path = pathlib.Path(src)
+    if not src_path.exists():
+        return
     try:
         if src_path.resolve() == dst.resolve():
             return
@@ -21,6 +23,70 @@ def copy_file_if_needed(src: str, dst: pathlib.Path) -> None:
         pass
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src_path, dst)
+
+
+def publish_stage_artifacts(
+    *,
+    run_dir: pathlib.Path,
+    monogenic_stage: dict[str, Any],
+    prs_stage: dict[str, Any],
+) -> dict[str, dict[str, str]]:
+    published: dict[str, dict[str, str]] = {"monogenic": {}, "prs": {}}
+
+    monogenic_dir = ensure_dir(run_dir / "monogenic")
+    monogenic_artifacts = monogenic_stage.get("artifacts") or {}
+    for source_key, filename in [
+        ("annotated_vcf", "annotated.vcf.gz"),
+        ("priority_summary", "priority_variants.summary.txt"),
+        ("priority_variants_tsv", "priority_variants.tsv"),
+        ("clinvar_unique_tsv", "clinvar_plp_unique_variants.tsv"),
+        ("lof_unique_tsv", "lof_unique_variants.tsv"),
+        ("review_unique_tsv", "rare_clinvar_review_unique_variants.tsv"),
+    ]:
+        source = monogenic_artifacts.get(source_key)
+        if not source:
+            continue
+        destination = monogenic_dir / filename
+        copy_file_if_needed(source, destination)
+        published["monogenic"][source_key] = str(destination)
+        index_path = source + ".tbi" if source.endswith(".vcf.gz") else None
+        if index_path and pathlib.Path(index_path).exists():
+            copy_file_if_needed(index_path, pathlib.Path(str(destination) + ".tbi"))
+
+    prs_dir = ensure_dir(run_dir / "prs")
+    prs_artifacts = prs_stage.get("artifacts") or {}
+    prs_imputed_artifacts = (prs_stage.get("imputed_genotypes") or {}).get("artifacts") or {}
+    dense_artifacts = (prs_stage.get("dense_genotypes") or {}).get("artifacts") or {}
+    for source_key, filename in [
+        ("aggregated_scores", "aggregated_scores.txt.gz"),
+        ("pgsc_report_html", "pgsc_report.html"),
+        ("match_summary", "match_summary.csv"),
+        ("match_diagnostics_json", "match_diagnostics.json"),
+        ("overlap_failures_tsv", "overlap_failures.tsv"),
+        ("imputed_vcf", "imputed_prs.vcf.gz"),
+    ]:
+        source = prs_artifacts.get(source_key) or prs_imputed_artifacts.get(source_key)
+        if not source:
+            continue
+        destination = prs_dir / filename
+        copy_file_if_needed(source, destination)
+        published["prs"][source_key] = str(destination)
+        index_path = source + ".tbi" if source.endswith(".vcf.gz") else None
+        if index_path and pathlib.Path(index_path).exists():
+            copy_file_if_needed(index_path, pathlib.Path(str(destination) + ".tbi"))
+
+    for source_key, filename in [
+        ("pre_match_audit_tsv", "pre_match_audit.tsv"),
+        ("pre_match_audit_json", "pre_match_audit.json"),
+    ]:
+        source = dense_artifacts.get(source_key) or prs_artifacts.get(source_key)
+        if not source:
+            continue
+        destination = prs_dir / filename
+        copy_file_if_needed(source, destination)
+        published["prs"][source_key] = str(destination)
+
+    return published
 
 
 def read_prs_rows(path: str | None, limit: int = 20) -> list[dict[str, str]]:
@@ -78,6 +144,7 @@ def render_report(
         "prs_stage": prs_stage,
     }
     artifact_manifest_path = report_dir / "artifact_manifest.json"
+    published_outputs = publish_stage_artifacts(run_dir=run_dir, monogenic_stage=monogenic_stage, prs_stage=prs_stage)
     write_json(artifact_manifest_path, summary_artifacts)
 
     report_path = report_dir / "report.md"
@@ -85,6 +152,7 @@ def render_report(
     reference_probe = context["reference_probe"]
     reference_stage = context["reference_bundle"]
     prs_dense = prs_stage.get("dense_genotypes") or {}
+    prs_imputed = prs_stage.get("imputed_genotypes") or {}
     prs_rows = read_prs_rows((prs_stage.get("artifacts") or {}).get("aggregated_scores"))
     monogenic_enabled = bool(context["manifest"]["analysis"]["monogenic"]["enabled"])
     prs_enabled = bool(context["manifest"]["analysis"]["prs"]["enabled"])
@@ -158,6 +226,9 @@ def render_report(
                 out.write(f"- ClinVar unique TSV: `{artifacts.get('clinvar_unique_tsv', 'n/a')}`\n")
                 out.write(f"- LoF unique TSV: `{artifacts.get('lof_unique_tsv', 'n/a')}`\n")
                 out.write(f"- Review queue unique TSV: `{artifacts.get('review_unique_tsv', 'n/a')}`\n")
+                published_monogenic = published_outputs.get("monogenic") or {}
+                if published_monogenic:
+                    out.write(f"- Published monogenic outputs: `{run_dir / 'monogenic'}`\n")
             else:
                 out.write(f"- Status: `{monogenic_stage.get('status', 'unknown')}`\n")
                 if monogenic_stage.get("message"):
@@ -173,18 +244,54 @@ def render_report(
                 dense_summary = prs_dense.get("summary") or {}
                 if dense_summary.get("union_sites") is not None:
                     out.write(f"- Union sites requested: `{dense_summary['union_sites']}`\n")
+                if dense_summary.get("accepted_strand_flip_rows") is not None:
+                    out.write(f"- Accepted rows rescued by strand complement: `{dense_summary['accepted_strand_flip_rows']}`\n")
+                accepted_rows_by_source = dense_summary.get("accepted_rows_by_source") or {}
+                if accepted_rows_by_source:
+                    out.write(
+                        "- Accepted score rows by source: "
+                        + ", ".join(f"`{key}`={value}" for key, value in accepted_rows_by_source.items())
+                        + "\n"
+                    )
+                skipped_reasons = dense_summary.get("skipped_reasons") or {}
+                if skipped_reasons:
+                    out.write(
+                        "- Skipped score rows by reason: "
+                        + ", ".join(f"`{key}`={value}" for key, value in skipped_reasons.items())
+                        + "\n"
+                    )
                 dense_artifacts = prs_dense.get("artifacts") or {}
                 if dense_artifacts.get("dense_vcf"):
                     out.write(f"- Dense PRS VCF: `{dense_artifacts['dense_vcf']}`\n")
                 if dense_artifacts.get("targets_vcf"):
                     out.write(f"- Union targets VCF: `{dense_artifacts['targets_vcf']}`\n")
+                if dense_artifacts.get("pre_match_audit_tsv"):
+                    out.write(f"- Pre-match audit TSV: `{dense_artifacts['pre_match_audit_tsv']}`\n")
+                if dense_artifacts.get("pre_match_audit_json"):
+                    out.write(f"- Pre-match audit JSON: `{dense_artifacts['pre_match_audit_json']}`\n")
+                published_prs = published_outputs.get("prs") or {}
+                if published_prs:
+                    out.write(f"- Published PRS outputs: `{run_dir / 'prs'}`\n")
+
+            if prs_imputed:
+                out.write(f"- Imputed genotype stage status: `{prs_imputed.get('status', 'unknown')}`\n")
+                render_import_details(out, prs_imputed.get("import_details"), prefix="Imputed genotype import")
+                imputed_artifacts = prs_imputed.get("artifacts") or {}
+                if imputed_artifacts.get("imputed_vcf"):
+                    out.write(f"- Imputed PRS VCF: `{imputed_artifacts['imputed_vcf']}`\n")
 
             out.write(f"- PRS scoring status: `{prs_stage.get('status', 'unknown')}`\n")
             if prs_stage.get("status") == "ok":
                 artifacts = prs_stage.get("artifacts") or {}
+                summary = prs_stage.get("summary") or {}
+                out.write(f"- Scoring input kind: `{summary.get('scoring_input_kind', 'unknown')}`\n")
                 out.write(f"- Aggregated scores: `{artifacts.get('aggregated_scores', 'n/a')}`\n")
                 if artifacts.get("pgsc_report_html"):
                     out.write(f"- pgsc_calc HTML report: `{artifacts['pgsc_report_html']}`\n")
+                if artifacts.get("match_diagnostics_json"):
+                    out.write(f"- Match diagnostics JSON: `{artifacts['match_diagnostics_json']}`\n")
+                if artifacts.get("overlap_failures_tsv"):
+                    out.write(f"- Match threshold summary TSV: `{artifacts['overlap_failures_tsv']}`\n")
                 if prs_rows:
                     out.write("\n| PGS | IID | SUM |\n")
                     out.write("| --- | --- | --- |\n")
@@ -193,13 +300,24 @@ def render_report(
                     out.write("\n")
             else:
                 diagnostics = prs_stage.get("diagnostics") or {}
+                artifacts = prs_stage.get("artifacts") or {}
                 if prs_stage.get("message"):
                     out.write(f"- Detail: {prs_stage['message']}\n")
+                if diagnostics.get("scoring_input_kind"):
+                    out.write(f"- Scoring input kind: `{diagnostics['scoring_input_kind']}`\n")
+                if artifacts.get("match_diagnostics_json"):
+                    out.write(f"- Match diagnostics JSON: `{artifacts['match_diagnostics_json']}`\n")
+                if artifacts.get("overlap_failures_tsv"):
+                    out.write(f"- Match threshold summary TSV: `{artifacts['overlap_failures_tsv']}`\n")
+                if artifacts.get("match_summary"):
+                    out.write(f"- Match summary CSV: `{artifacts['match_summary']}`\n")
                 overlap_failures = diagnostics.get("overlap_failures") or []
                 if overlap_failures:
-                    out.write("- Matching threshold diagnostics:\n")
+                    out.write("\n| Score | Match % |\n")
+                    out.write("| --- | ---: |\n")
                     for item in overlap_failures:
-                        out.write(f"  - `{item['score']}` matched `{item['match_percent']}%`\n")
+                        out.write(f"| {item['score']} | {item['match_percent']} |\n")
+                    out.write("\n")
                 if diagnostics.get("log_path"):
                     out.write(f"- Log: `{diagnostics['log_path']}`\n")
             out.write("\n")
@@ -228,6 +346,7 @@ def render_report(
             "reference_bundle": reference_stage.get("status"),
             "monogenic": monogenic_stage.get("status"),
             "prs_dense_genotypes": prs_dense.get("status"),
+            "prs_imputed_genotypes": prs_imputed.get("status"),
             "prs": prs_stage.get("status"),
         },
     }

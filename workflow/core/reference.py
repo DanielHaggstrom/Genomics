@@ -276,7 +276,7 @@ def infer_reuse_requirements(manifest: dict[str, Any]) -> dict[str, Any]:
     monogenic_enabled = manifest["analysis"]["monogenic"]["enabled"]
     prs_enabled = manifest["analysis"]["prs"]["enabled"]
     monogenic_reference_required = bool(monogenic_enabled and not (reuse.get("annotated_vcf") or reuse.get("called_vcf")))
-    prs_reference_required = bool(prs_enabled and not reuse.get("prs_dense_vcf"))
+    prs_reference_required = bool(prs_enabled and not (reuse.get("prs_dense_vcf") or reuse.get("imputed_prs_vcf")))
     return {
         "monogenic_reference_required": monogenic_reference_required,
         "prs_reference_required": prs_reference_required,
@@ -361,6 +361,7 @@ def prepare_import_artifact(
     normalized = pathlib.Path(normalize_path(raw_path, base_dir=manifest_dir))
     if not normalized.exists():
         raise SystemExit(f"Configured reuse artifact not found: {normalized}")
+    fingerprint = sample_file_fingerprint(normalized)
 
     active, staged = stage_maybe(normalized, staging_root / label, linux_cache_root)
     active_path = pathlib.Path(active)
@@ -393,6 +394,7 @@ def prepare_import_artifact(
         "original": str(normalized),
         "active": str(active_path),
         "staged": staged,
+        "fingerprint": fingerprint,
         "provenance": provenance,
         "trusted_provenance": trusted,
         "sidecars": sidecars,
@@ -464,7 +466,7 @@ def cmd_prepare_context(args: argparse.Namespace) -> int:
             linux_cache_root=linux_cache_root,
             current_input_fingerprint_id=input_fingerprint["id"],
         )
-        for key in ("called_vcf", "annotated_vcf", "prs_dense_vcf")
+        for key in ("called_vcf", "annotated_vcf", "prs_dense_vcf", "imputed_prs_vcf")
     }
 
     executable_checks = detect_required_executables()

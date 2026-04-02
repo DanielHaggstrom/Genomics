@@ -23,6 +23,12 @@ analysis:
     run_ancestry: false
     reference_db: null
     min_overlap: 0.75
+    imputation:
+      enabled: false
+      backend: beagle
+      reference_panel: null
+      info_threshold: 0.8
+      dosage_field: DS
 
 runtime:
   profile: docker

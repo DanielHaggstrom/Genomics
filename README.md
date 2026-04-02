@@ -20,6 +20,7 @@ Supported:
   - called VCF
   - annotated VCF
   - dense PRS VCF
+  - imputed PRS VCF
 
 Out of scope:
 - clinical diagnosis
@@ -67,6 +68,7 @@ Reuse is allowed only at explicit stage boundaries:
 - `reuse.called_vcf`
 - `reuse.annotated_vcf`
 - `reuse.prs_dense_vcf`
+- `reuse.imputed_prs_vcf`
 
 Those imports do not create alternate execution graphs. They only skip the stage that would normally generate the same artifact.
 
@@ -104,6 +106,7 @@ Main fields:
 - `analysis.monogenic`
 - `analysis.prs`
 - `analysis.prs.sample_sex`
+- `analysis.prs.imputation`
 - `analysis.monogenic.workers`
 - `analysis.monogenic.pairhmm_threads`
 - `analysis.prs.workers`
@@ -131,6 +134,11 @@ The worker and `pairhmm_threads` fields are optional narrow overrides. If omitte
 - current free-disk headroom relative to `runtime.min_free_gb`
 
 The default behavior is to use the automatic planner and only set those fields when you need to tune a run deliberately.
+
+PRS imputation is now an explicit compatibility surface:
+- `analysis.prs.imputation.enabled: true` signals that PRS should use an imputation-compatible path
+- `reuse.imputed_prs_vcf` lets you score a precomputed imputed PRS VCF as a stage-boundary import
+- the local Beagle/reference-panel backend is still the next implementation step; for now, enabling imputation without providing an imported imputed VCF will fail fast with a clear message instead of silently falling back
 
 Tracked example presets live in:
 - `manifests/examples/score_presets.yaml`

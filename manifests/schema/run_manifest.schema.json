@@ -48,6 +48,10 @@
         "prs_dense_vcf": {
           "type": "string",
           "minLength": 1
+        },
+        "imputed_prs_vcf": {
+          "type": "string",
+          "minLength": 1
         }
       }
     },
@@ -193,6 +197,39 @@
                 "null"
               ],
               "minimum": 1
+            },
+            "imputation": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "backend": {
+                  "type": "string",
+                  "enum": [
+                    "beagle"
+                  ]
+                },
+                "reference_panel": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "info_threshold": {
+                  "type": "number",
+                  "minimum": 0.0,
+                  "maximum": 1.0
+                },
+                "dosage_field": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1
+                }
+              }
             }
           },
           "allOf": [
