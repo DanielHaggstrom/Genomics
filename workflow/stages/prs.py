@@ -575,11 +575,30 @@ def main() -> None:
     context = load_json(args.context)
     cfg = context["manifest"]["analysis"]["prs"]
     stage_root = ensure_dir(pathlib.Path(context["cache"]["prs_root"]))
+    live_status_path = stage_root / "stage_status.json"
     stage_manifest_path = stage_root / "stage_manifest.json"
     scoring_root = stage_root / "scoring"
     cache_key = f"v{STAGE_VERSION}:{context['input_fingerprint']['id']}:initializing"
 
     try:
+        progress: dict[str, Any] | None = None
+        dense_info: dict[str, Any] | None = None
+
+        def write_live_status(status: str, *, phase: str | None = None, message: str | None = None, diagnostics: dict[str, Any] | None = None, artifacts: dict[str, Any] | None = None) -> None:
+            payload = stage_payload(
+                "prs",
+                status,
+                cache_key=cache_key,
+                input_fingerprint_id=context["input_fingerprint"]["id"],
+                dense_genotypes=dense_info,
+                progress=progress,
+                phase=phase,
+                message=message,
+                diagnostics=diagnostics,
+                artifacts=artifacts or {"log_dir": str(stage_root / "logs")},
+            )
+            write_json(live_status_path, {key: value for key, value in payload.items() if value is not None})
+
         if not cfg["enabled"]:
             payload = stage_payload("prs", "skipped", message="PRS stage disabled.")
             write_json(args.output, payload)
@@ -587,7 +606,6 @@ def main() -> None:
 
         reference_stage = context["reference_bundle"]
         imported_dense = context["reuse"].get("prs_dense_vcf")
-        dense_info: dict[str, Any]
 
         if imported_dense:
             dense_vcf = pathlib.Path(imported_dense["active"])
@@ -609,6 +627,8 @@ def main() -> None:
                 },
             )
             score_hash = "imported"
+            progress = {"phase": "scoring_imported_dense_vcf"}
+            write_live_status("running", phase="scoring_imported_dense_vcf")
         else:
             if reference_stage.get("status") != "ready":
                 payload = stage_payload(
@@ -642,6 +662,8 @@ def main() -> None:
                         "targets_vcf_index": union_stage["artifacts"]["targets_vcf_index"],
                     },
                 )
+                progress = {"phase": "scoring_reused_dense_vcf"}
+                write_live_status("running", phase="scoring_reused_dense_vcf")
             else:
                 docker_bin = context["host_checks"]["docker"] or "docker"
                 ensure_docker_ready(docker_bin)
@@ -659,6 +681,26 @@ def main() -> None:
                     free_gb=context["disk"].get("free_gb"),
                     min_free_gb=context["disk"].get("min_free_gb"),
                 )
+                progress = {
+                    "phase": "building_dense_genotypes",
+                    "score_hash": score_hash,
+                    "total_shards": len(shards),
+                    "completed_shards": 0,
+                    "pending_shards": len(shards),
+                    "completed_shard_names": [],
+                }
+                dense_info = stage_payload(
+                    "prs_dense_genotypes",
+                    "running",
+                    score_hash=score_hash,
+                    summary=union_stage.get("summary"),
+                    worker_plan=worker_plan,
+                    artifacts={
+                        "targets_vcf": union_stage["artifacts"]["targets_vcf"],
+                        "targets_vcf_index": union_stage["artifacts"]["targets_vcf_index"],
+                    },
+                )
+                write_live_status("running", phase="building_dense_genotypes")
 
                 tasks = [
                     (
@@ -676,7 +718,25 @@ def main() -> None:
                     )
                     for shard in shards
                 ]
-                dense_shards = run_tasks_in_parallel(tasks, max_workers=worker_plan["workers"])
+                shard_names = [shard["name"] for shard in shards]
+
+                def on_shard_complete(index: int, _result: Any) -> None:
+                    assert progress is not None
+                    shard_name = shard_names[index]
+                    completed = progress["completed_shard_names"]
+                    if shard_name not in completed:
+                        completed.append(shard_name)
+                    progress["completed_shards"] = len(completed)
+                    progress["pending_shards"] = len(shards) - len(completed)
+                    progress["last_completed_shard"] = shard_name
+                    write_live_status("running", phase="building_dense_genotypes")
+
+                dense_shards = run_tasks_in_parallel(tasks, max_workers=worker_plan["workers"], on_complete=on_shard_complete)
+                progress = {
+                    **(progress or {}),
+                    "phase": "concatenating_dense_vcf",
+                }
+                write_live_status("running", phase="concatenating_dense_vcf")
                 dense_vcf_path = concat_dense_vcf(dense_root, reference_fasta, context["sample_id"], dense_shards)
                 dense_info = stage_payload(
                     "prs_dense_genotypes",
@@ -692,6 +752,11 @@ def main() -> None:
                         "targets_vcf_index": union_stage["artifacts"]["targets_vcf_index"],
                     },
                 )
+                progress = {
+                    **(progress or {}),
+                    "phase": "scoring_dense_vcf",
+                }
+                write_live_status("running", phase="scoring_dense_vcf")
 
         scoring_root = ensure_dir(stage_root / score_hash / "scoring")
         stage_manifest_path = scoring_root / "stage_manifest.json"
@@ -707,6 +772,7 @@ def main() -> None:
         )
         reused = load_existing_stage(stage_manifest_path, cache_key)
         if reused and (reused.get("dense_genotypes") or {}).get("artifacts", {}).get("dense_vcf") == dense_info.get("artifacts", {}).get("dense_vcf"):
+            write_json(live_status_path, reused)
             write_json(args.output, reused)
             return
 
@@ -746,6 +812,7 @@ def main() -> None:
                 },
             )
             write_json(stage_manifest_path, payload)
+            write_json(live_status_path, payload)
             write_json(args.output, payload)
             return
 
@@ -789,6 +856,7 @@ def main() -> None:
             },
         )
         write_json(stage_manifest_path, payload)
+        write_json(live_status_path, payload)
         write_json(args.output, payload)
     except Exception as exc:
         payload = stage_payload(
@@ -797,9 +865,12 @@ def main() -> None:
             cache_key=cache_key,
             input_fingerprint_id=context["input_fingerprint"]["id"],
             message=str(exc),
+            dense_genotypes=dense_info,
+            progress=progress,
             artifacts={"log_dir": str(scoring_root / "logs")},
         )
         write_json(stage_manifest_path, payload)
+        write_json(live_status_path, payload)
         write_json(args.output, payload)
 
 

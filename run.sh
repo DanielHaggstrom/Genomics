@@ -3,13 +3,19 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [[ $# -lt 1 || $# -gt 2 ]]; then
-  echo "Usage: bash run.sh manifests/<sample>.yaml [profile]"
+if [[ $# -lt 1 ]]; then
+  echo "Usage: bash run.sh manifests/<sample>.yaml [profile] [nextflow args...]"
   exit 1
 fi
 
 MANIFEST="$1"
-PROFILE="${2:-docker}"
+shift
+PROFILE="docker"
+if [[ $# -gt 0 && "$1" != -* ]]; then
+  PROFILE="$1"
+  shift
+fi
+NEXTFLOW_ARGS=("$@")
 ABS_MANIFEST="$(cd "$(dirname "$MANIFEST")" && pwd)/$(basename "$MANIFEST")"
 
 PROJECT_CACHE_ROOT="$(
@@ -27,4 +33,5 @@ nextflow \
   run "$ROOT_DIR" \
   -params-file "$ABS_MANIFEST" \
   -profile "$PROFILE" \
-  -work-dir "$PROJECT_CACHE_ROOT/nextflow/work"
+  -work-dir "$PROJECT_CACHE_ROOT/nextflow/work" \
+  "${NEXTFLOW_ARGS[@]}"

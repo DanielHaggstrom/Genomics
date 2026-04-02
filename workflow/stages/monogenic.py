@@ -17,7 +17,6 @@ from workflow.core.runtime import (
     ensure_docker_ready,
     load_json,
     plan_worker_pool,
-    read_text_if_exists,
     remove_if_exists,
     run_command,
     run_tasks_in_parallel,
@@ -762,19 +761,6 @@ def annotate_with_vep(
     return str(output_vcf)
 
 
-def parse_summary_file(path: pathlib.Path) -> dict[str, str]:
-    out: dict[str, str] = {}
-    text = read_text_if_exists(path)
-    if not text:
-        return out
-    for line in text.splitlines():
-        if "\t" not in line:
-            continue
-        key, value = line.split("\t", 1)
-        out[key] = value
-    return out
-
-
 def build_import_summary(reuse_entry: dict[str, Any] | None) -> dict[str, Any] | None:
     if not reuse_entry:
         return None
@@ -811,6 +797,25 @@ def main() -> None:
     )
 
     try:
+        worker_plan: dict[str, Any] | None = None
+        progress: dict[str, Any] | None = None
+
+        def write_stage_status(status: str, *, phase: str | None = None, message: str | None = None, artifacts: dict[str, Any] | None = None) -> None:
+            payload = stage_payload(
+                "monogenic",
+                status,
+                cache_key=cache_key,
+                input_fingerprint_id=context["input_fingerprint"]["id"],
+                source_mode=source_mode or None,
+                import_details=import_details,
+                worker_plan=worker_plan,
+                progress=progress,
+                phase=phase,
+                message=message,
+                artifacts=artifacts or {"log_dir": str(stage_root / "logs")},
+            )
+            write_json(stage_manifest_path, {key: value for key, value in payload.items() if value is not None})
+
         if not cfg["enabled"]:
             payload = stage_payload("monogenic", "skipped", message="Monogenic stage disabled.")
             write_json(args.output, payload)
@@ -844,11 +849,13 @@ def main() -> None:
             annotated_vcf = pathlib.Path(annotated_vcf_import["active"])
             source_mode = "import_annotated_vcf"
             import_details = build_import_summary(annotated_vcf_import)
+            write_stage_status("running", phase="using_imported_annotated_vcf")
         else:
             if called_vcf:
                 filtered_vcf = pathlib.Path(called_vcf["active"])
                 source_mode = "import_called_vcf"
                 import_details = build_import_summary(called_vcf)
+                write_stage_status("running", phase="annotating_imported_called_vcf")
             else:
                 if reference_stage.get("status") != "ready":
                     payload = stage_payload(
@@ -879,6 +886,14 @@ def main() -> None:
                     free_gb=context["disk"].get("free_gb"),
                     min_free_gb=context["disk"].get("min_free_gb"),
                 )
+                progress = {
+                    "phase": "calling_shards",
+                    "total_shards": len(shards),
+                    "completed_shards": 0,
+                    "pending_shards": len(shards),
+                    "completed_shard_names": [],
+                }
+                write_stage_status("running", phase="calling_shards")
 
                 tasks = [
                     (
@@ -895,7 +910,26 @@ def main() -> None:
                     )
                     for shard in shards
                 ]
-                shard_vcfs = run_tasks_in_parallel(tasks, max_workers=worker_plan["workers"])
+                shard_names = [shard["name"] for shard in shards]
+
+                def on_shard_complete(index: int, _result: Any) -> None:
+                    assert progress is not None
+                    shard_name = shard_names[index]
+                    completed = progress["completed_shard_names"]
+                    if shard_name not in completed:
+                        completed.append(shard_name)
+                    progress["completed_shards"] = len(completed)
+                    progress["pending_shards"] = len(shards) - len(completed)
+                    progress["last_completed_shard"] = shard_name
+                    write_stage_status("running", phase="calling_shards")
+
+                shard_vcfs = run_tasks_in_parallel(tasks, max_workers=worker_plan["workers"], on_complete=on_shard_complete)
+                progress = {
+                    **(progress or {}),
+                    "phase": "concat_and_filter",
+                    "raw_shard_vcf_count": len(shard_vcfs),
+                }
+                write_stage_status("running", phase="concat_and_filter")
                 _, filtered_vcf_path = concat_and_filter_monogenic(stage_root, reference_fasta, sample_id, shard_vcfs, docker_bin)
                 filtered_vcf = pathlib.Path(filtered_vcf_path)
                 source_mode = "called_from_cram"
@@ -904,6 +938,11 @@ def main() -> None:
 
             annotated_vcf = stage_root / f"{context['sample_id']}.vep.clinvar_enriched.vcf.gz"
             vep_root = ensure_vep_resources(pathlib.Path(context["runtime"]["tool_cache_root"]))
+            progress = {
+                **(progress or {}),
+                "phase": "annotating_with_vep",
+            }
+            write_stage_status("running", phase="annotating_with_vep")
             annotate_with_vep(
                 docker_bin=docker_bin,
                 input_vcf=filtered_vcf,
@@ -914,6 +953,11 @@ def main() -> None:
 
         priority_tsv = stage_root / "priority_variants.tsv"
         priority_summary = stage_root / "priority_variants.summary.txt"
+        progress = {
+            **(progress or {}),
+            "phase": "triaging_variants",
+        }
+        write_stage_status("running", phase="triaging_variants")
         summary = extract_priority_variants(annotated_vcf, priority_tsv, priority_summary)
         build_shortlists(priority_tsv, stage_root)
         review_queue = stage_root / "rare_clinvar_review_queue.tsv"
@@ -949,6 +993,8 @@ def main() -> None:
             cache_key=cache_key,
             input_fingerprint_id=context["input_fingerprint"]["id"],
             message=str(exc),
+            worker_plan=worker_plan,
+            progress=progress,
             artifacts={"log_dir": str(stage_root / "logs")},
         )
         write_json(stage_manifest_path, payload)

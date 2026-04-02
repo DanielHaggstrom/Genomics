@@ -8,6 +8,7 @@ from workflow.core.runtime import (
     parse_memory_to_mb,
     plan_contig_shards,
     plan_worker_pool,
+    run_tasks_in_parallel,
 )
 
 
@@ -78,6 +79,16 @@ class RuntimeHelperTests(unittest.TestCase):
         self.assertEqual(plan["workers"], 2)
         self.assertEqual(plan["pairhmm_threads"], 2)
         self.assertEqual(plan["limits"]["disk_worker_limit"], 2)
+
+    def test_run_tasks_in_parallel_reports_completed_tasks(self) -> None:
+        seen: list[tuple[int, str]] = []
+        results = run_tasks_in_parallel(
+            [lambda: "first", lambda: "second"],
+            max_workers=2,
+            on_complete=lambda idx, result: seen.append((idx, result)),
+        )
+        self.assertEqual(results, ["first", "second"])
+        self.assertEqual(sorted(seen), [(0, "first"), (1, "second")])
 
 
 if __name__ == "__main__":

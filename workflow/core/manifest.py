@@ -6,7 +6,7 @@ import pathlib
 import sys
 from typing import Any
 
-from workflow.core.runtime import REPO_ROOT, load_yaml, normalize_path, validate_payload, write_json
+from workflow.core.runtime import REPO_ROOT, hash_strings, load_json, load_yaml, normalize_path, sample_file_fingerprint, validate_payload, write_json
 
 
 DEFAULTS = {
@@ -179,6 +179,68 @@ def cmd_print_project_cache_root(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_status(args: argparse.Namespace) -> int:
+    from workflow.core.reference import project_cache_id
+    import json
+
+    manifest_path = pathlib.Path(args.manifest).resolve()
+    schema_path = REPO_ROOT / "manifests" / "schema" / "run_manifest.schema.json"
+    manifest = validate_manifest_file(manifest_path, schema_path)
+
+    linux_cache_root = pathlib.Path(resolve_linux_cache_root(manifest_path))
+    project_cache_root = linux_cache_root / project_cache_id()
+    normalized_cram = pathlib.Path(normalize_path(manifest["inputs"]["cram"], base_dir=manifest_path.parent))
+    normalized_crai = pathlib.Path(normalize_path(manifest["inputs"]["crai"], base_dir=manifest_path.parent))
+
+    payload: dict[str, Any] = {
+        "manifest_path": str(manifest_path),
+        "execution_mode": derive_execution_mode(manifest),
+        "project_cache_root": str(project_cache_root),
+        "paths": {
+            "nextflow_log": str(project_cache_root / "nextflow" / "nextflow.log"),
+        },
+        "inputs": {
+            "cram": str(normalized_cram),
+            "crai": str(normalized_crai),
+            "cram_exists": normalized_cram.exists(),
+            "crai_exists": normalized_crai.exists(),
+        },
+    }
+
+    if normalized_cram.exists() and normalized_crai.exists():
+        def load_status_json(path: pathlib.Path) -> dict[str, Any] | None:
+            if not path.exists():
+                return None
+            try:
+                return load_json(path)
+            except Exception as exc:
+                return {"status": "unreadable", "message": str(exc), "path": str(path)}
+
+        cram_fingerprint = sample_file_fingerprint(normalized_cram)
+        crai_fingerprint = sample_file_fingerprint(normalized_crai)
+        input_fingerprint_id = hash_strings([cram_fingerprint["id"], crai_fingerprint["id"]])
+        sample_cache_root = project_cache_root / "samples" / input_fingerprint_id
+        monogenic_status_path = sample_cache_root / "monogenic" / "stage_manifest.json"
+        prs_status_path = sample_cache_root / "prs" / "stage_status.json"
+        payload["input_fingerprint_id"] = input_fingerprint_id
+        payload["paths"].update(
+            {
+                "monogenic_stage_status": str(monogenic_status_path),
+                "prs_stage_status": str(prs_status_path),
+            }
+        )
+        payload["stage_statuses"] = {
+            "monogenic": load_status_json(monogenic_status_path),
+            "prs": load_status_json(prs_status_path),
+        }
+
+    if args.output:
+        write_json(args.output, payload)
+    else:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -196,6 +258,11 @@ def build_parser() -> argparse.ArgumentParser:
     project_cache_root_parser = subparsers.add_parser("print-project-cache-root")
     project_cache_root_parser.add_argument("--manifest", required=True)
     project_cache_root_parser.set_defaults(func=cmd_print_project_cache_root)
+
+    status_parser = subparsers.add_parser("status")
+    status_parser.add_argument("--manifest", required=True)
+    status_parser.add_argument("--output")
+    status_parser.set_defaults(func=cmd_status)
 
     return parser
 

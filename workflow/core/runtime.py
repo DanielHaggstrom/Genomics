@@ -315,16 +315,6 @@ def plan_contig_shards(contigs: Iterable[str], prefix: str) -> list[dict[str, An
     return shards
 
 
-def resolve_docker_bin(preferred: str | None = None) -> str:
-    if preferred and detect_executable(preferred):
-        return preferred
-    for candidate in ("docker.exe", "docker"):
-        path = detect_executable(candidate)
-        if path:
-            return candidate
-    raise SystemExit("Neither docker.exe nor docker is available in PATH.")
-
-
 def ensure_docker_ready(docker_bin: str) -> None:
     completed = run_command([docker_bin, "version", "--format", "{{.Server.Version}}"], check=False)
     if completed.returncode == 0:
@@ -503,17 +493,27 @@ def run_tasks_in_parallel(
     tasks: Iterable[Callable[[], Any]],
     *,
     max_workers: int,
+    on_complete: Callable[[int, Any], None] | None = None,
 ) -> list[Any]:
     task_list = list(tasks)
     if not task_list:
         return []
     if max_workers <= 1:
-        return [task() for task in task_list]
+        results = []
+        for idx, task in enumerate(task_list):
+            result = task()
+            results.append(result)
+            if on_complete is not None:
+                on_complete(idx, result)
+        return results
 
     results: list[Any] = [None] * len(task_list)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {executor.submit(task): idx for idx, task in enumerate(task_list)}
         for future in as_completed(future_map):
             idx = future_map[future]
-            results[idx] = future.result()
+            result = future.result()
+            results[idx] = result
+            if on_complete is not None:
+                on_complete(idx, result)
     return results

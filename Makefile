@@ -1,12 +1,14 @@
 SHELL := /usr/bin/env bash
 
 RUN ?= manifests/examples/sample.yaml
+EXTRA ?=
 
-.PHONY: help run validate validate-manifest test clean clean-cache clean-all
+.PHONY: help run status validate validate-manifest test clean clean-cache clean-all
 
 help:
 	@echo "Targets:"
 	@echo "  run                - run the pipeline (set RUN=manifests/<sample>.yaml)"
+	@echo "  status             - print cache/log/stage status locations for a manifest"
 	@echo "  validate           - run syntax checks"
 	@echo "  validate-manifest  - validate a manifest (set RUN=manifests/<sample>.yaml)"
 	@echo "  test               - run unit tests"
@@ -16,7 +18,11 @@ help:
 
 run:
 	@test -n "$(RUN)" || (echo "Set RUN=manifests/<sample>.yaml"; exit 1)
-	@bash run.sh "$(RUN)"
+	@bash run.sh "$(RUN)" $(EXTRA)
+
+status:
+	@test -n "$(RUN)" || (echo "Set RUN=manifests/<sample>.yaml"; exit 1)
+	@PYTHONPATH=. python3 -m workflow.core.manifest status --manifest "$(RUN)"
 
 validate:
 	@python3 -m py_compile workflow/core/*.py workflow/stages/*.py workflow/reporting/*.py tests/*.py

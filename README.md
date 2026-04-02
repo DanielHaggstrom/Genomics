@@ -35,6 +35,12 @@ Preferred command:
 bash run.sh manifests/local/<sample>.yaml
 ```
 
+Resume-friendly form:
+
+```bash
+bash run.sh manifests/local/<sample>.yaml -resume
+```
+
 Direct command:
 
 ```bash
@@ -174,6 +180,25 @@ Worker selection is also automatic now:
 - monogenic and PRS dense-genotype stages size their worker pools from available CPU, memory, shard count, and disk headroom
 - optional per-stage overrides stay narrow and explicit in the manifest
 - live tuning during a run is not supported yet; the sane operator path is still stop, adjust settings, and relaunch with cache reuse
+
+Useful operator commands:
+
+```bash
+make status RUN=manifests/local/<sample>.yaml
+docker stats
+```
+
+`make status` prints:
+- the project cache root
+- the active `nextflow.log`
+- the monogenic stage status manifest path
+- the PRS stage status manifest path
+
+The long-running monogenic and PRS stages now update their cache-side status manifests while they are still running, including:
+- current phase
+- total and completed shard counts
+- last completed shard
+- the active worker plan when shard work is underway
 
 That avoids the earlier design where PRS walked chromosomes in one long serial shell loop and monogenic ran as one giant whole-genome caller task.
 
