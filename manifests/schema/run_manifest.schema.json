@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Genomics Run Manifest",
+  "description": "Single-sample CRAM-first manifest for monogenic triage plus a PRS scaffold workflow, with optional scaffold-based imputation before scoring.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -47,11 +48,13 @@
         },
         "prs_dense_vcf": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "description": "Stage-boundary import for the PRS scaffold VCF. The historical key name is retained for compatibility."
         },
         "imputed_prs_vcf": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "description": "Stage-boundary import for an imputed PRS scaffold VCF."
         }
       }
     },
@@ -166,7 +169,8 @@
               "type": [
                 "string",
                 "null"
-              ]
+              ],
+              "description": "Reference database that defines the broad common-variant backbone for the PRS scaffold. The intended GRCh38 default is pgsc_HGDP+1kGP_v1."
             },
             "sample_sex": {
               "type": [
@@ -201,6 +205,7 @@
             "imputation": {
               "type": "object",
               "additionalProperties": false,
+              "description": "Optional scaffold-based PRS imputation settings. When enabled, the PRS scaffold is used as the target genome surface before scoring.",
               "properties": {
                 "enabled": {
                   "type": "boolean"

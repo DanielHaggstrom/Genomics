@@ -2,7 +2,7 @@
 
 Single-sample, research-use genome analysis from `CRAM/CRAI` to:
 - monogenic triage
-- dense PRS genotypes plus PRS scoring
+- broad PRS scaffold genotypes plus optional PRS imputation and PRS scoring
 - one final Markdown report
 
 Supported execution modes:
@@ -15,11 +15,12 @@ Supported execution modes:
 Supported:
 - one sample at a time
 - CRAM-first SNV/indel monogenic triage
-- PRS from a dense genotype VCF generated from the CRAM
+- PRS from a broad common-variant scaffold generated from the CRAM
+- optional PRS-only imputation on that scaffold for better score portability
 - explicit stage-boundary imports for:
   - called VCF
   - annotated VCF
-  - dense PRS VCF
+  - PRS scaffold VCF
   - imputed PRS VCF
 
 Out of scope:
@@ -59,7 +60,8 @@ CRAM/CRAI
 -> validated manifest
 -> prepared context (reference probe + bundle validation + WSL-native staging)
 -> monogenic stage
--> dense PRS genotypes
+-> PRS scaffold stage
+-> optional PRS imputation stage
 -> PRS scoring
 -> one report
 ```
@@ -71,6 +73,8 @@ Reuse is allowed only at explicit stage boundaries:
 - `reuse.imputed_prs_vcf`
 
 Those imports do not create alternate execution graphs. They only skip the stage that would normally generate the same artifact.
+
+For compatibility, the manifest key `reuse.prs_dense_vcf` is still accepted, but the intended meaning is now the PRS scaffold artifact rather than the older PRS-targeted dense VCF concept.
 
 ## Repo Layout
 
@@ -105,6 +109,7 @@ Main fields:
 - `reference.bundle_id`
 - `analysis.monogenic`
 - `analysis.prs`
+- `analysis.prs.reference_db`
 - `analysis.prs.sample_sex`
 - `analysis.prs.imputation`
 - `analysis.monogenic.workers`
@@ -127,6 +132,8 @@ The pipeline intentionally rejects manifests where both branches are disabled.
 
 If `analysis.prs.sample_sex` is set to `male` or `female`, the PRS compatibility step keeps sex chromosomes and writes a one-sample `.psam` for downstream tools. If it is omitted, PRS compatibility falls back to autosomes only.
 
+`analysis.prs.reference_db` defines the common-variant backbone used to build the PRS scaffold. The intended GRCh38 default is `pgsc_HGDP+1kGP_v1`, which matches the PGS Catalog calculator ecosystem and gives the PRS path a broad target-genome surface instead of only the requested score loci.
+
 The worker and `pairhmm_threads` fields are optional narrow overrides. If omitted, the pipeline now chooses them automatically from:
 - `runtime.max_cpus`
 - `runtime.max_memory`
@@ -136,13 +143,18 @@ The worker and `pairhmm_threads` fields are optional narrow overrides. If omitte
 The default behavior is to use the automatic planner and only set those fields when you need to tune a run deliberately.
 
 PRS imputation is now an explicit compatibility surface:
-- `analysis.prs.imputation.enabled: true` signals that PRS should use an imputation-compatible path
+- `analysis.prs.imputation.enabled: true` signals that PRS should use an imputed scaffold path
 - `reuse.imputed_prs_vcf` lets you score a precomputed imputed PRS VCF as a stage-boundary import
 - the local backend now expects `analysis.prs.imputation.reference_panel` to point at a panel manifest ID or YAML path
-- the first local backend is a single-sample Beagle path against a per-chromosome phased reference panel
+- the first local backend is a single-sample Beagle path against a per-chromosome phased reference panel, operating on the scaffold backbone rather than a PRS-targeted site list
 - because this repo is single-sample, the first local backend does not run `conform-gt`; the official `conform-gt` docs say its statistical strand checks require at least 20 target samples
 - tracked example panel manifests live under `manifests/examples/imputation_panels/`
 - local panel manifests belong under ignored `manifests/local/imputation_panels/`
+
+The important design shift is:
+- WGS already contains the underlying DNA information
+- the difficult part is representing that information on the standardized common-variant surface that `pgsc_calc` expects
+- this repo now treats that scaffold-first path as the intended PRS strategy instead of trying to score directly from a PRS-targeted genotype subset
 
 Tracked example presets live in:
 - `manifests/examples/score_presets.yaml`
@@ -190,7 +202,7 @@ Performance-sensitive stages are structured as scatter/gather:
 - dense PRS genotyping is sharded by chromosome plus one `alt` shard
 
 Worker selection is also automatic now:
-- monogenic and PRS dense-genotype stages size their worker pools from available CPU, memory, shard count, and disk headroom
+- monogenic and PRS scaffold-building stages size their worker pools from available CPU, memory, shard count, and disk headroom
 - optional per-stage overrides stay narrow and explicit in the manifest
 - live tuning during a run is not supported yet; the sane operator path is still stop, adjust settings, and relaunch with cache reuse
 

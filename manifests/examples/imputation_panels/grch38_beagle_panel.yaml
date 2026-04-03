@@ -1,3 +1,6 @@
+# Example local imputation panel manifest for scaffold-based PRS imputation.
+# The intended target is a broad common-variant PRS scaffold VCF, not a
+# score-locus-only targeted VCF.
 panel_id: grch38_beagle_panel
 build: GRCh38
 contig_prefix: chr

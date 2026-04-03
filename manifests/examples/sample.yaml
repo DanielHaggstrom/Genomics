@@ -21,10 +21,10 @@ analysis:
     score_preset: demo
     sample_sex: male
     run_ancestry: false
-    reference_db: null
+    reference_db: pgsc_HGDP+1kGP_v1
     min_overlap: 0.75
     imputation:
-      enabled: false
+      enabled: true
       backend: beagle
       reference_panel: grch38_beagle_panel
       info_threshold: 0.8

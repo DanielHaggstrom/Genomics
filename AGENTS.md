@@ -12,7 +12,7 @@ Keep this project on the path of highest sanity:
 
 The supported product is:
 
-`single-sample CRAM/CRAI -> monogenic triage + dense PRS genotypes + PRS scoring -> one report`
+`single-sample CRAM/CRAI -> monogenic triage + broad PRS scaffold genotypes + optional PRS imputation + PRS scoring -> one report`
 
 ## Scope Guardrails
 
@@ -20,7 +20,8 @@ In scope:
 - single-sample research-use analysis
 - CRAM-first execution
 - monogenic SNV/indel triage
-- PRS from a dense genotype VCF generated from CRAM
+- PRS from a broad common-variant scaffold generated from CRAM
+- optional PRS-only imputation as a compatibility layer on that scaffold
 - explicit stage-boundary imports only
 - reference validation, caching, reporting, and performance work directly needed for the above
 
