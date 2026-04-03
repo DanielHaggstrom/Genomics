@@ -7,14 +7,17 @@ import gzip
 import json
 import pathlib
 import re
+import time
 import urllib.request
 from typing import Any, Callable
 
 from workflow.core.runtime import (
     REPO_ROOT,
+    atomic_copy,
     build_docker_run_command,
     complete_artifact,
     complete_artifacts_exist,
+    detect_executable,
     ensure_dir,
     ensure_docker_ready,
     hash_strings,
@@ -43,6 +46,9 @@ GATK_IMAGE = "broadinstitute/gatk:4.6.1.0"
 PLINK2_IMAGE = "ghcr.io/pgscatalog/plink2:2.00a5.10"
 BEAGLE_URL = "https://faculty.washington.edu/browning/beagle/beagle.29Oct24.c8e.jar"
 OVERLAP_RE = re.compile(r"Score (\S+) fails minimum matching threshold \(([\d.]+)% variants match\)")
+CONTIG_HEADER_RE = re.compile(r"^##contig=<ID=([^,>]+)")
+DOWNLOAD_RETRIES = 4
+DOWNLOAD_TIMEOUT_SECONDS = 600
 BASE_COMPLEMENTS = {
     "A": "T",
     "C": "G",
@@ -92,6 +98,156 @@ def parse_overlap_diagnostics(log_text: str) -> list[dict[str, str]]:
 
 def canonical_score_id(score_name: str) -> str:
     return re.sub(r"_hmPOS_GRCh\d+$", "", score_name)
+
+
+def shared_genomics_cache_root(path: pathlib.Path) -> pathlib.Path | None:
+    current = path.resolve()
+    while current != current.parent:
+        if current.name == "tool_cache":
+            return current.parent.parent
+        current = current.parent
+    return None
+
+
+def is_valid_gzip_file(path: pathlib.Path) -> bool:
+    try:
+        with gzip.open(path, "rb") as handle:
+            while handle.read(1024 * 1024):
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def mirror_shared_tool_cache_file(
+    destination: pathlib.Path,
+    pattern: str,
+    *,
+    validator: Callable[[pathlib.Path], bool] | None = None,
+) -> pathlib.Path | None:
+    shared_root = shared_genomics_cache_root(destination)
+    if shared_root is None or not shared_root.exists():
+        return None
+    for candidate in sorted(shared_root.glob(pattern)):
+        try:
+            same_file = candidate.resolve() == destination.resolve()
+        except FileNotFoundError:
+            same_file = False
+        if same_file or not candidate.exists():
+            continue
+        if validator is not None and not validator(candidate):
+            continue
+        ensure_dir(destination.parent)
+        atomic_copy(candidate, destination)
+        return destination
+    return None
+
+
+def fetch_url_text(url: str) -> str:
+    curl = detect_executable("curl")
+    wget = detect_executable("wget")
+    last_error: Exception | None = None
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        try:
+            if curl:
+                completed = run_command(
+                    [
+                        curl,
+                        "-fsSL",
+                        "--retry",
+                        "5",
+                        "--retry-delay",
+                        "2",
+                        "--retry-all-errors",
+                        "--connect-timeout",
+                        "30",
+                        "--max-time",
+                        str(DOWNLOAD_TIMEOUT_SECONDS),
+                        url,
+                    ],
+                    check=True,
+                )
+                return completed.stdout
+            if wget:
+                completed = run_command(
+                    [
+                        wget,
+                        "-qO-",
+                        "--tries=5",
+                        "--timeout=30",
+                        url,
+                    ],
+                    check=True,
+                )
+                return completed.stdout
+            with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+                return response.read().decode("utf-8")
+        except Exception as exc:  # pragma: no cover - network fallback
+            last_error = exc
+            if attempt < DOWNLOAD_RETRIES:
+                time.sleep(attempt * 2)
+    raise RuntimeError(f"Failed to fetch URL after retries: {url}") from last_error
+
+
+def download_url_to_path(
+    url: str,
+    destination: pathlib.Path,
+    *,
+    validator: Callable[[pathlib.Path], bool] | None = None,
+) -> pathlib.Path:
+    curl = detect_executable("curl")
+    wget = detect_executable("wget")
+    temp_path = destination.with_suffix(destination.suffix + ".tmp")
+    last_error: Exception | None = None
+    ensure_dir(destination.parent)
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        remove_if_exists(temp_path)
+        try:
+            if curl:
+                run_command(
+                    [
+                        curl,
+                        "-fsSL",
+                        "--retry",
+                        "5",
+                        "--retry-delay",
+                        "2",
+                        "--retry-all-errors",
+                        "--connect-timeout",
+                        "30",
+                        "--max-time",
+                        str(DOWNLOAD_TIMEOUT_SECONDS),
+                        "-o",
+                        str(temp_path),
+                        url,
+                    ],
+                    check=True,
+                )
+            elif wget:
+                run_command(
+                    [
+                        wget,
+                        "-O",
+                        str(temp_path),
+                        "--tries=5",
+                        "--timeout=30",
+                        url,
+                    ],
+                    check=True,
+                )
+            else:
+                with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+                    temp_path.write_bytes(response.read())
+            if validator is not None and not validator(temp_path):
+                raise RuntimeError(f"Downloaded file failed validation: {url}")
+            temp_path.replace(destination)
+            return destination
+        except Exception as exc:  # pragma: no cover - network fallback
+            last_error = exc
+            remove_if_exists(temp_path)
+            if attempt < DOWNLOAD_RETRIES:
+                time.sleep(attempt * 2)
+    raise RuntimeError(f"Failed to download URL after retries: {url}") from last_error
 
 
 def init_score_audit(pgs_ids: list[str]) -> dict[str, dict[str, int]]:
@@ -254,6 +410,29 @@ def base_contig_name(contig: str, prefix: str) -> str:
     return contig
 
 
+def inject_missing_contig_headers(header_text: str, contigs: list[str]) -> str:
+    lines = header_text.splitlines()
+    declared = set()
+    for line in lines:
+        found = CONTIG_HEADER_RE.match(line)
+        if found:
+            declared.add(found.group(1))
+    missing = [contig for contig in contigs if contig and contig not in declared]
+    if not missing:
+        return header_text
+
+    output: list[str] = []
+    inserted = False
+    for line in lines:
+        if not inserted and line.startswith("#CHROM"):
+            output.extend(f"##contig=<ID={contig}>" for contig in missing)
+            inserted = True
+        output.append(line)
+    if not inserted:
+        output.extend(f"##contig=<ID={contig}>" for contig in missing)
+    return "\n".join(output) + "\n"
+
+
 def is_manifest_path(raw: str) -> bool:
     return any(token in raw for token in ("/", "\\")) or raw.endswith(".yaml")
 
@@ -312,7 +491,10 @@ def load_imputation_panel(context: dict[str, Any]) -> dict[str, Any]:
     if not chrom_vcf_pattern:
         raise RuntimeError(f"Imputation panel manifest is missing chrom_vcf_pattern: {manifest_path}")
 
-    panel_prefix = str(panel.get("contig_prefix") or context["contig_prefix"] or "")
+    if "contig_prefix" in panel:
+        panel_prefix = str(panel.get("contig_prefix") or "")
+    else:
+        panel_prefix = str(context["contig_prefix"] or "")
     chromosomes = [str(item) for item in (panel.get("chromosomes") or [str(i) for i in range(1, 23)] + ["X"])]
     base_chromosomes = sorted({base_contig_name(item, panel_prefix) for item in chromosomes})
 
@@ -360,7 +542,10 @@ def ensure_beagle_jar(tool_cache_root: pathlib.Path) -> pathlib.Path:
     jar_path = beagle_root / pathlib.Path(BEAGLE_URL).name
     if jar_path.exists():
         return jar_path
-    urllib.request.urlretrieve(BEAGLE_URL, jar_path)
+    mirrored = mirror_shared_tool_cache_file(jar_path, f"*/tool_cache/beagle/{jar_path.name}")
+    if mirrored is not None:
+        return mirrored
+    download_url_to_path(BEAGLE_URL, jar_path)
     return jar_path
 
 
@@ -522,17 +707,26 @@ def resolve_score_row_alleles_for_site(
 
 
 def fetch_scorefile_url(pgs_id: str) -> str:
-    with urllib.request.urlopen(f"https://www.pgscatalog.org/rest/score/{pgs_id}", timeout=60) as response:
-        payload = json.load(response)
+    payload = json.loads(fetch_url_text(f"https://www.pgscatalog.org/rest/score/{pgs_id}"))
     return payload["ftp_harmonized_scoring_files"]["GRCh38"]["positions"]
 
 
 def resolve_cached_scorefile(score_cache_root: pathlib.Path, pgs_id: str) -> pathlib.Path | None:
     exact = score_cache_root / f"{pgs_id}_hmPOS_GRCh38.txt.gz"
-    if exact.exists():
+    if exact.exists() and is_valid_gzip_file(exact):
         return exact
+    remove_if_exists(exact)
     matches = sorted(score_cache_root.glob(f"{pgs_id}_*.txt.gz"))
-    return matches[0] if matches else None
+    for candidate in matches:
+        if is_valid_gzip_file(candidate):
+            return candidate
+        remove_if_exists(candidate)
+    mirrored = mirror_shared_tool_cache_file(
+        score_cache_root / f"{pgs_id}_hmPOS_GRCh38.txt.gz",
+        f"*/tool_cache/pgs_scorefiles/GRCh38/{pgs_id}_*.txt.gz",
+        validator=is_valid_gzip_file,
+    )
+    return mirrored
 
 
 def build_union_sites(
@@ -586,7 +780,7 @@ def build_union_sites(
         if score_path is None:
             url = fetch_scorefile_url(pgs_id)
             score_path = score_cache_root / pathlib.Path(url).name
-            urllib.request.urlretrieve(url, score_path)
+            download_url_to_path(url, score_path, validator=is_valid_gzip_file)
 
         per_score_counts[pgs_id] = 0
         with gzip.open(score_path, "rt", encoding="utf-8", errors="replace") as handle:
@@ -924,9 +1118,26 @@ def rename_contig_for_panel(
 
     rename_map = shard_dir / f"{shard_name}.rename.tsv"
     rename_map.write_text(f"{source_contig}\t{target_contig}\n", encoding="utf-8")
+    header_result = run_command(
+        ["bcftools", "view", "-h", str(input_vcf)],
+        check=True,
+        log_path=shard_dir / f"{shard_name}.rename.header.log",
+    )
+    header_fixed_input = input_vcf
+    updated_header = inject_missing_contig_headers(header_result.stdout, [source_contig])
+    if updated_header != header_result.stdout:
+        header_path = shard_dir / f"{shard_name}.rename.header.txt"
+        header_path.write_text(updated_header, encoding="utf-8")
+        header_fixed_input = shard_dir / f"{shard_name}.rename.headerfix.vcf.gz"
+        remove_if_exists(header_fixed_input, f"{header_fixed_input}.tbi")
+        run_command(
+            ["bcftools", "reheader", "-h", str(header_path), "-o", str(header_fixed_input), str(input_vcf)],
+            check=True,
+            log_path=shard_dir / f"{shard_name}.rename.reheader.log",
+        )
     remove_if_exists(renamed_vcf, f"{renamed_vcf}.tbi")
     run_command(
-        ["bcftools", "annotate", "--rename-chrs", str(rename_map), "-Oz", "-o", str(renamed_vcf), str(input_vcf)],
+        ["bcftools", "annotate", "--rename-chrs", str(rename_map), "-Oz", "-o", str(renamed_vcf), str(header_fixed_input)],
         check=True,
         log_path=shard_dir / f"{shard_name}.rename.log",
     )
@@ -936,6 +1147,40 @@ def rename_contig_for_panel(
         log_path=shard_dir / f"{shard_name}.rename.index.log",
     )
     return renamed_vcf
+
+
+def build_dense_passthrough_shard(
+    *,
+    dense_vcf: pathlib.Path,
+    shard_dir: pathlib.Path,
+    shard_name: str,
+    sample_id: str,
+    region_arg: str,
+) -> tuple[pathlib.Path, bool]:
+    passthrough_vcf = shard_dir / f"{sample_id}.{shard_name}.dense_passthrough.vcf.gz"
+    passthrough_reused = complete_artifact(passthrough_vcf)
+    if not passthrough_reused:
+        remove_if_exists(passthrough_vcf, f"{passthrough_vcf}.tbi")
+        run_command(
+            ["bcftools", "view", "-r", region_arg, "-Oz", "-o", str(passthrough_vcf), str(dense_vcf)],
+            check=True,
+            log_path=shard_dir / f"{shard_name}.passthrough.log",
+        )
+        run_command(
+            ["tabix", "-f", "-p", "vcf", str(passthrough_vcf)],
+            check=True,
+            log_path=shard_dir / f"{shard_name}.passthrough.index.log",
+        )
+    return passthrough_vcf, passthrough_reused
+
+
+def target_has_imputable_markers(*, target_vcf: pathlib.Path, shard_dir: pathlib.Path, shard_name: str) -> bool:
+    result = run_command(
+        ["bcftools", "view", "-H", "-i", 'ALT!="."', str(target_vcf)],
+        check=True,
+        log_path=shard_dir / f"{shard_name}.imputable_markers.log",
+    )
+    return any(line.strip() for line in result.stdout.splitlines())
 
 
 def finalize_imputed_vcf(
@@ -994,26 +1239,20 @@ def build_imputed_prs_shard(
     region_arg = ",".join(shard["intervals"])
 
     if shard["imputation_mode"] == "passthrough":
-        passthrough_vcf = shard_dir / f"{context['sample_id']}.{shard['name']}.dense_passthrough.vcf.gz"
-        passthrough_reused = complete_artifact(passthrough_vcf)
-        if not passthrough_reused:
-            remove_if_exists(passthrough_vcf, f"{passthrough_vcf}.tbi")
-            run_command(
-                ["bcftools", "view", "-r", region_arg, "-Oz", "-o", str(passthrough_vcf), str(dense_vcf)],
-                check=True,
-                log_path=shard_dir / f"{shard['name']}.passthrough.log",
-            )
-            run_command(
-                ["tabix", "-f", "-p", "vcf", str(passthrough_vcf)],
-                check=True,
-                log_path=shard_dir / f"{shard['name']}.passthrough.index.log",
-            )
+        passthrough_vcf, passthrough_reused = build_dense_passthrough_shard(
+            dense_vcf=dense_vcf,
+            shard_dir=shard_dir,
+            shard_name=shard["name"],
+            sample_id=context["sample_id"],
+            region_arg=region_arg,
+        )
         return {
             "shard_name": shard["name"],
             "mode": "passthrough",
             "output_vcf": str(passthrough_vcf),
             "reused": passthrough_reused,
             "panel_chrom": None,
+            "passthrough_reason": "panel_unavailable",
         }
 
     final_vcf = shard_dir / f"{context['sample_id']}.{shard['name']}.imputed.filtered.vcf.gz"
@@ -1039,6 +1278,22 @@ def build_imputed_prs_shard(
         source_contig=shard["intervals"][0],
         target_contig=shard["panel_resource"]["panel_chrom"],
     )
+    if not target_has_imputable_markers(target_vcf=target_input, shard_dir=shard_dir, shard_name=shard["name"]):
+        passthrough_vcf, passthrough_reused = build_dense_passthrough_shard(
+            dense_vcf=dense_vcf,
+            shard_dir=shard_dir,
+            shard_name=shard["name"],
+            sample_id=context["sample_id"],
+            region_arg=region_arg,
+        )
+        return {
+            "shard_name": shard["name"],
+            "mode": "passthrough",
+            "output_vcf": str(passthrough_vcf),
+            "reused": passthrough_reused,
+            "panel_chrom": shard["panel_resource"]["panel_chrom"],
+            "passthrough_reason": "no_imputable_markers",
+        }
     panel_resources = stage_panel_resources(
         shard["panel_resource"],
         stage_root=stage_root,
@@ -1175,8 +1430,8 @@ def build_or_reuse_imputed_vcf(
         requested_workers=context["manifest"]["analysis"]["prs"].get("workers"),
         requested_pairhmm_threads=context["manifest"]["analysis"]["prs"].get("pairhmm_threads"),
         default_worker_cap=6,
-        default_pairhmm_cap=2,
-        min_memory_per_worker_gb=2.5,
+        default_pairhmm_cap=3,
+        min_memory_per_worker_gb=2.0,
         free_gb=context["disk"].get("free_gb"),
         min_free_gb=context["disk"].get("min_free_gb"),
     )
@@ -1600,9 +1855,9 @@ def main() -> None:
                     max_memory=context["manifest"]["runtime"]["max_memory"],
                     requested_workers=cfg.get("workers"),
                     requested_pairhmm_threads=cfg.get("pairhmm_threads"),
-                    default_worker_cap=4,
-                    default_pairhmm_cap=2,
-                    min_memory_per_worker_gb=2.5,
+                    default_worker_cap=6,
+                    default_pairhmm_cap=3,
+                    min_memory_per_worker_gb=2.0,
                     free_gb=context["disk"].get("free_gb"),
                     min_free_gb=context["disk"].get("min_free_gb"),
                 )

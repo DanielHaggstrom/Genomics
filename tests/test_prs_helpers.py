@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import unittest
 from pathlib import Path
 import tempfile
@@ -8,6 +9,8 @@ from workflow.stages.prs import (
     base_contig_name,
     canonical_score_id,
     complement_base_tokens,
+    inject_missing_contig_headers,
+    target_has_imputable_markers,
     load_imputation_panel,
     parse_base_tokens,
     parse_overlap_diagnostics,
@@ -38,8 +41,10 @@ class PrsHelperTests(unittest.TestCase):
             root = Path(tmpdir)
             exact = root / "PGS999001_hmPOS_GRCh38.txt.gz"
             other = root / "PGS999001_other.txt.gz"
-            exact.write_text("x", encoding="utf-8")
-            other.write_text("y", encoding="utf-8")
+            with gzip.open(exact, "wt", encoding="utf-8") as handle:
+                handle.write("x\n")
+            with gzip.open(other, "wt", encoding="utf-8") as handle:
+                handle.write("y\n")
             self.assertEqual(resolve_cached_scorefile(root, "PGS999001"), exact)
 
     def test_safe_sampleset_name_normalizes_reserved_and_symbols(self) -> None:
@@ -75,6 +80,54 @@ class PrsHelperTests(unittest.TestCase):
     def test_base_contig_name_strips_chr_prefix(self) -> None:
         self.assertEqual(base_contig_name("chr7", "chr"), "7")
         self.assertEqual(base_contig_name("7", ""), "7")
+
+    def test_inject_missing_contig_headers_inserts_before_column_header(self) -> None:
+        original = "##fileformat=VCFv4.2\n##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n"
+        updated = inject_missing_contig_headers(original, ["5"])
+        self.assertIn("##contig=<ID=5>\n#CHROM", updated)
+
+    def test_inject_missing_contig_headers_is_idempotent_for_declared_contigs(self) -> None:
+        original = "##fileformat=VCFv4.2\n##contig=<ID=5>\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n"
+        updated = inject_missing_contig_headers(original, ["5"])
+        self.assertEqual(updated, original)
+
+    def test_target_has_imputable_markers_ignores_reference_only_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            vcf = root / "reference_only.vcf"
+            vcf.write_text(
+                "\n".join(
+                    [
+                        "##fileformat=VCFv4.2",
+                        "##contig=<ID=chrX>",
+                        "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
+                        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE",
+                        "chrX\t45216839\t.\tC\t.\t.\tPASS\t.\tGT\t0/0",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(target_has_imputable_markers(target_vcf=vcf, shard_dir=root, shard_name="chrX"))
+
+    def test_target_has_imputable_markers_accepts_variant_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            vcf = root / "variant.vcf"
+            vcf.write_text(
+                "\n".join(
+                    [
+                        "##fileformat=VCFv4.2",
+                        "##contig=<ID=chr5>",
+                        "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
+                        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE",
+                        "chr5\t12345\t.\tG\tA\t.\tPASS\t.\tGT\t0/1",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(target_has_imputable_markers(target_vcf=vcf, shard_dir=root, shard_name="chr5"))
 
     def test_resolve_score_row_alleles_prefers_explicit_other_allele(self) -> None:
         resolved, reason = resolve_score_row_alleles(
@@ -280,6 +333,7 @@ class PrsHelperTests(unittest.TestCase):
             loaded = load_imputation_panel(context)
             self.assertEqual(loaded["panel_id"], "demo_panel")
             self.assertEqual(loaded["build"], "GRCh38")
+            self.assertEqual(loaded["contig_prefix"], "")
             self.assertEqual(loaded["base_chromosomes"], ["1", "X"])
             self.assertTrue(str(panel_dir) in loaded["manifest_path"])
             self.assertTrue(loaded["chrom_vcf_pattern"].endswith("/panel/chr{base_chrom}.vcf.gz"))
