@@ -7,6 +7,9 @@ import gzip
 import json
 import pathlib
 import re
+import shlex
+import shutil
+import tarfile
 import time
 import urllib.request
 from typing import Any, Callable
@@ -39,16 +42,17 @@ from workflow.core.runtime import (
 )
 
 
-STAGE_VERSION = 7
-UNION_SITE_VERSION = 3
-IMPUTATION_STAGE_VERSION = 1
+STAGE_VERSION = 8
+UNION_SITE_VERSION = 4
+IMPUTATION_STAGE_VERSION = 2
 GATK_IMAGE = "broadinstitute/gatk:4.6.1.0"
 PLINK2_IMAGE = "ghcr.io/pgscatalog/plink2:2.00a5.10"
 BEAGLE_URL = "https://faculty.washington.edu/browning/beagle/beagle.29Oct24.c8e.jar"
+REFERENCE_DB_BASE_URL = "https://ftp.ebi.ac.uk/pub/databases/spot/pgs/resources"
 OVERLAP_RE = re.compile(r"Score (\S+) fails minimum matching threshold \(([\d.]+)% variants match\)")
 CONTIG_HEADER_RE = re.compile(r"^##contig=<ID=([^,>]+)")
 DOWNLOAD_RETRIES = 4
-DOWNLOAD_TIMEOUT_SECONDS = 600
+DOWNLOAD_TIMEOUT_SECONDS = 21600
 BASE_COMPLEMENTS = {
     "A": "T",
     "C": "G",
@@ -437,6 +441,288 @@ def is_manifest_path(raw: str) -> bool:
     return any(token in raw for token in ("/", "\\")) or raw.endswith(".yaml")
 
 
+def allowed_prs_base_chromosomes(context: dict[str, Any]) -> list[str]:
+    chromosomes = [str(i) for i in range(1, 23)]
+    if (context["manifest"]["analysis"]["prs"].get("sample_sex") or "").strip():
+        chromosomes.append("X")
+    return chromosomes
+
+
+def allowed_prs_contigs(context: dict[str, Any]) -> set[str]:
+    prefix = context["contig_prefix"]
+    return {normalize_contig(chrom, prefix) for chrom in allowed_prs_base_chromosomes(context)}
+
+
+def strip_vcf_suffix(path: pathlib.Path) -> pathlib.Path:
+    if path.name.endswith(".vcf.gz"):
+        return path.with_name(path.name[:-7])
+    if path.suffix == ".bcf":
+        return path.with_suffix("")
+    if path.suffix == ".vcf":
+        return path.with_suffix("")
+    return path
+
+
+def resolve_reference_db_archive_url(reference_db: str) -> str:
+    cleaned = reference_db.strip()
+    if cleaned.startswith(("http://", "https://")):
+        return cleaned
+    return f"{REFERENCE_DB_BASE_URL}/{cleaned}.tar.zst"
+
+
+def locate_reference_db_prefix(extracted_root: pathlib.Path, build: str) -> pathlib.Path:
+    matches = sorted(extracted_root.rglob(f"{build}_*_ALL.pvar.zst"))
+    if not matches:
+        raise RuntimeError(f"Could not locate a {build} reference-db pvar.zst in {extracted_root}")
+    pvar_path = matches[0]
+    if not pvar_path.name.endswith(".pvar.zst"):
+        raise RuntimeError(f"Unexpected reference-db pvar name: {pvar_path.name}")
+    prefix_name = pvar_path.name[: -len(".pvar.zst")]
+    prefix_path = pvar_path.with_name(prefix_name)
+    for suffix in (".pvar.zst", ".pgen", ".psam"):
+        candidate = prefix_path.with_name(prefix_path.name + suffix)
+        if not candidate.exists():
+            raise RuntimeError(f"Reference database is missing expected file: {candidate}")
+    return prefix_path
+
+
+def python_has_zstandard() -> bool:
+    completed = run_command(["python3", "-c", "import zstandard"], check=False)
+    return completed.returncode == 0
+
+
+def extract_tar_zst_archive(
+    archive_path: pathlib.Path,
+    extracted_root: pathlib.Path,
+    *,
+    log_path: pathlib.Path,
+) -> None:
+    if detect_executable("zstd"):
+        run_command(
+            ["tar", "--zstd", "-xf", str(archive_path), "-C", str(extracted_root)],
+            check=True,
+            log_path=log_path,
+        )
+        return
+    if not python_has_zstandard():
+        raise RuntimeError(
+            "Reference database extraction requires either a 'zstd' executable or the Python 'zstandard' module."
+        )
+    script = """
+import pathlib
+import sys
+import tarfile
+import zstandard
+
+archive_path = pathlib.Path(sys.argv[1])
+extract_root = pathlib.Path(sys.argv[2])
+extract_root.mkdir(parents=True, exist_ok=True)
+
+with archive_path.open("rb") as source:
+    dctx = zstandard.ZstdDecompressor()
+    with dctx.stream_reader(source) as reader:
+        with tarfile.open(fileobj=reader, mode="r|") as archive:
+            archive.extractall(path=extract_root)
+"""
+    run_command(
+        ["python3", "-c", script, str(archive_path), str(extracted_root)],
+        check=True,
+        log_path=log_path,
+    )
+
+
+def ensure_reference_db_assets(context: dict[str, Any]) -> dict[str, Any]:
+    reference_db = str(context["manifest"]["analysis"]["prs"].get("reference_db") or "").strip()
+    if not reference_db:
+        raise RuntimeError("analysis.prs.reference_db is required when PRS is enabled.")
+
+    tool_cache_root = pathlib.Path(context["runtime"]["tool_cache_root"])
+    reference_db_root = ensure_dir(tool_cache_root / "pgs_reference_db")
+
+    if is_manifest_path(reference_db) or reference_db.endswith(".tar.zst"):
+        archive_path = pathlib.Path(normalize_path(reference_db, base_dir=pathlib.Path(context["manifest_path"]).parent))
+        reference_db_id = archive_path.name.replace(".tar.zst", "")
+        if not archive_path.exists():
+            raise RuntimeError(f"Reference database archive not found: {archive_path}")
+    else:
+        reference_db_id = reference_db
+        archive_path = reference_db_root / f"{reference_db_id}.tar.zst"
+        if not archive_path.exists():
+            mirrored = mirror_shared_tool_cache_file(
+                archive_path,
+                f"*/tool_cache/pgs_reference_db/{archive_path.name}",
+            )
+            if mirrored is None:
+                download_url_to_path(resolve_reference_db_archive_url(reference_db_id), archive_path)
+
+    archive_fingerprint = sample_file_fingerprint(archive_path)["id"][:16]
+    extracted_root = ensure_dir(reference_db_root / f"{reference_db_id}-{archive_fingerprint}")
+    ready_marker = extracted_root / ".ready"
+    if not ready_marker.exists():
+        extract_tar_zst_archive(
+            archive_path,
+            extracted_root,
+            log_path=extracted_root / "extract.log",
+        )
+        ready_marker.write_text(archive_fingerprint + "\n", encoding="utf-8")
+
+    prefix_path = locate_reference_db_prefix(extracted_root, context["manifest"]["reference"]["build"])
+    return {
+        "reference_db_id": reference_db_id,
+        "archive_path": str(archive_path),
+        "archive_fingerprint": archive_fingerprint,
+        "extracted_root": str(extracted_root),
+        "prefix_path": str(prefix_path),
+    }
+
+
+def export_reference_db_pvar_for_contig(
+    *,
+    context: dict[str, Any],
+    reference_db: dict[str, Any],
+    targets_root: pathlib.Path,
+    base_chrom: str,
+) -> pathlib.Path:
+    docker_bin = context["host_checks"]["docker"] or "docker"
+    ensure_docker_ready(docker_bin)
+
+    output_root = ensure_dir(targets_root / "reference_db")
+    pvar_path = output_root / f"{base_chrom}.pvar"
+    if pvar_path.exists():
+        return pvar_path
+
+    extracted_root = pathlib.Path(reference_db["extracted_root"])
+    prefix_path = pathlib.Path(reference_db["prefix_path"])
+    relative_prefix = prefix_path.relative_to(extracted_root).as_posix()
+    run_command(
+        build_docker_run_command(
+            image=PLINK2_IMAGE,
+            mounts={
+                extracted_root: "/refdb",
+                output_root: "/out",
+            },
+            inner_args=[
+                "plink2",
+                "--pfile", f"/refdb/{relative_prefix}", "vzs",
+                "--allow-extra-chr",
+                "--chr", base_chrom,
+                "--make-just-pvar",
+                "--out", f"/out/{base_chrom}",
+            ],
+            docker_bin=docker_bin,
+        ),
+        check=True,
+        log_path=output_root / f"{base_chrom}.plink2.log",
+    )
+    if not pvar_path.exists():
+        raise RuntimeError(f"Reference database export did not produce {pvar_path}")
+    return pvar_path
+
+
+def parse_pvar_header(raw_header: str) -> dict[str, int]:
+    fields = raw_header.lstrip("#").rstrip("\n").split("\t")
+    index = {name: idx for idx, name in enumerate(fields)}
+    required = ("CHROM", "POS", "REF", "ALT")
+    missing = [name for name in required if name not in index]
+    if missing:
+        raise RuntimeError(f"Reference database pvar header is missing columns: {', '.join(missing)}")
+    return index
+
+
+def iter_reference_db_sites(pvar_path: pathlib.Path, *, target_prefix: str):
+    with open(pvar_path, "r", encoding="utf-8") as handle:
+        header_index: dict[str, int] | None = None
+        for raw in handle:
+            if raw.startswith("##"):
+                continue
+            if raw.startswith("#"):
+                header_index = parse_pvar_header(raw)
+                continue
+            if header_index is None:
+                raise RuntimeError(f"Reference database pvar header not found in {pvar_path}")
+            fields = raw.rstrip("\n").split("\t")
+            chrom = normalize_contig(fields[header_index["CHROM"]], target_prefix)
+            pos = int(fields[header_index["POS"]])
+            ref = fields[header_index["REF"]]
+            alts = [token for token in fields[header_index["ALT"]].split(",") if token and token != "."]
+            yield {
+                "chrom": chrom,
+                "pos": pos,
+                "ref": ref,
+                "alts": alts,
+            }
+
+
+def write_scaffold_plain_vcf(
+    *,
+    destination: pathlib.Path,
+    contigs: list[str],
+    contig_lengths: dict[str, int],
+    rows: list[dict[str, Any]],
+) -> pathlib.Path:
+    with open(destination, "w", encoding="utf-8") as out:
+        out.write("##fileformat=VCFv4.2\n")
+        for contig in contigs:
+            length = contig_lengths.get(contig)
+            if length is not None:
+                out.write(f"##contig=<ID={contig},length={length}>\n")
+            else:
+                out.write(f"##contig=<ID={contig}>\n")
+        out.write("##INFO=<ID=PGS_IDS,Number=.,Type=String,Description=\"PGS IDs contributing to this scaffold site\">\n")
+        out.write("##INFO=<ID=SITE_SOURCE,Number=.,Type=String,Description=\"Origin of the scaffold site (reference_db or score_extra)\">\n")
+        out.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
+        for row in rows:
+            info_parts = []
+            if row.get("pgs_ids"):
+                info_parts.append("PGS_IDS=" + ",".join(sorted(row["pgs_ids"])))
+            if row.get("site_source"):
+                info_parts.append("SITE_SOURCE=" + ",".join(sorted(row["site_source"])))
+            out.write(
+                f"{row['chrom']}\t{row['pos']}\t.\t{row['ref']}\t{','.join(row['alts']) or '.'}\t.\tPASS\t"
+                + (";".join(info_parts) if info_parts else ".")
+                + "\n"
+            )
+    return destination
+
+
+def compress_vcf(path: pathlib.Path, *, log_path: pathlib.Path) -> pathlib.Path:
+    output = path.with_suffix(path.suffix + ".gz")
+    if complete_artifact(output):
+        return output
+    remove_if_exists(output, f"{output}.tbi")
+    run_command(["bcftools", "view", "-Oz", "-o", str(output), str(path)], check=True, log_path=log_path)
+    run_command(["tabix", "-f", "-p", "vcf", str(output)], check=True, log_path=log_path.with_name(log_path.stem + ".index.log"))
+    return output
+
+
+def merge_scaffold_contig_vcfs(
+    *,
+    backbone_vcf: pathlib.Path | None,
+    extras_vcf: pathlib.Path | None,
+    output_vcf: pathlib.Path,
+    log_path: pathlib.Path,
+) -> pathlib.Path:
+    if output_vcf.exists() and complete_artifact(output_vcf):
+        return output_vcf
+    remove_if_exists(output_vcf, f"{output_vcf}.tbi")
+    if backbone_vcf and extras_vcf:
+        command = (
+            "set -euo pipefail; "
+            f"bcftools concat -a -Ou {shlex.quote(str(backbone_vcf))} {shlex.quote(str(extras_vcf))} "
+            f"| bcftools sort -Ou "
+            f"| bcftools norm --rm-dup exact -Oz -o {shlex.quote(str(output_vcf))}; "
+            f"tabix -f -p vcf {shlex.quote(str(output_vcf))}"
+        )
+        run_command(["bash", "-lc", command], check=True, log_path=log_path)
+        return output_vcf
+    source = backbone_vcf or extras_vcf
+    if source is None:
+        raise RuntimeError("Cannot merge scaffold contig VCFs without an input source.")
+    run_command(["bcftools", "view", "-Oz", "-o", str(output_vcf), str(source)], check=True, log_path=log_path)
+    run_command(["tabix", "-f", "-p", "vcf", str(output_vcf)], check=True, log_path=log_path.with_name(log_path.stem + ".index.log"))
+    return output_vcf
+
+
 def resolve_imputation_panel_manifest_path(context: dict[str, Any]) -> pathlib.Path:
     manifest_path = pathlib.Path(context["manifest_path"])
     panel_ref = ((context["manifest"]["analysis"]["prs"].get("imputation") or {}).get("reference_panel") or "").strip()
@@ -738,12 +1024,24 @@ def build_union_sites(
 ) -> dict[str, Any]:
     pgs_ids = context["manifest"]["analysis"]["prs"]["pgs_ids"]
     prefix = context["contig_prefix"]
-    score_hash = hash_strings([f"union-v{UNION_SITE_VERSION}", *pgs_ids])[:16]
+    reference_db = ensure_reference_db_assets(context)
+    backbone_base_chromosomes = allowed_prs_base_chromosomes(context)
+    score_hash = hash_strings(
+        [
+            f"scaffold-v{UNION_SITE_VERSION}",
+            reference_db["reference_db_id"],
+            *backbone_base_chromosomes,
+            *pgs_ids,
+        ]
+    )[:16]
     targets_root = ensure_dir(stage_root / score_hash / "targets")
     union_manifest_path = targets_root / "union_manifest.json"
     reuse_key = {
         "union_site_version": UNION_SITE_VERSION,
         "pgs_ids": pgs_ids,
+        "reference_db_id": reference_db["reference_db_id"],
+        "reference_db_archive_fingerprint": reference_db["archive_fingerprint"],
+        "backbone_base_chromosomes": backbone_base_chromosomes,
         "reference_bundle_id": context["reference_bundle"].get("bundle_id"),
         "reference_fasta": str(reference_fasta),
         "contig_prefix": prefix,
@@ -762,7 +1060,9 @@ def build_union_sites(
     score_cache_root = ensure_dir(pathlib.Path(context["runtime"]["tool_cache_root"]) / "pgs_scorefiles" / "GRCh38")
     fasta = IndexedFasta(reference_fasta, reference_fai)
     contig_order = {contig: idx for idx, contig in enumerate(fasta.index.keys())}
-    site_map: dict[tuple[str, int, str], dict[str, object]] = {}
+    contig_lengths = {contig: meta[0] for contig, meta in fasta.index.items()}
+    allowed_contigs = allowed_prs_contigs(context)
+    extras_by_contig: dict[str, dict[tuple[str, int, str], dict[str, object]]] = {}
     per_score_counts: dict[str, int] = {}
     per_score_audit = init_score_audit(pgs_ids)
     accepted_rows_by_source = {
@@ -774,6 +1074,48 @@ def build_union_sites(
     strand_flip_rows = 0
     skipped = 0
     skipped_reasons: dict[str, int] = {}
+    backbone_sites = 0
+    score_extra_sites = 0
+    scaffold_contigs: list[str] = []
+    backbone_contig_vcfs: list[pathlib.Path] = []
+    extra_contig_vcfs: list[pathlib.Path] = []
+
+    for base_chrom in backbone_base_chromosomes:
+        pvar_path = export_reference_db_pvar_for_contig(
+            context=context,
+            reference_db=reference_db,
+            targets_root=targets_root,
+            base_chrom=base_chrom,
+        )
+        target_contig = normalize_contig(base_chrom, prefix)
+        rows = []
+        for record in iter_reference_db_sites(pvar_path, target_prefix=prefix):
+            if record["chrom"] not in allowed_contigs:
+                continue
+            rows.append(
+                {
+                    "chrom": record["chrom"],
+                    "pos": record["pos"],
+                    "ref": record["ref"],
+                    "alts": record["alts"],
+                    "pgs_ids": set(),
+                    "site_source": {"reference_db"},
+                }
+            )
+        if not rows:
+            continue
+        backbone_sites += len(rows)
+        scaffold_contigs.append(target_contig)
+        backbone_plain = targets_root / f"{target_contig}.backbone.vcf"
+        write_scaffold_plain_vcf(
+            destination=backbone_plain,
+            contigs=[target_contig],
+            contig_lengths=contig_lengths,
+            rows=rows,
+        )
+        backbone_contig_vcfs.append(
+            compress_vcf(backbone_plain, log_path=targets_root / f"{target_contig}.backbone.compress.log")
+        )
 
     for pgs_id in pgs_ids:
         score_path = resolve_cached_scorefile(score_cache_root, pgs_id)
@@ -804,6 +1146,11 @@ def build_union_sites(
                     continue
 
                 chrom = normalize_contig(chrom_raw, prefix)
+                if chrom not in allowed_contigs:
+                    skipped += 1
+                    skipped_reasons["non_scaffold_contig"] = skipped_reasons.get("non_scaffold_contig", 0) + 1
+                    increment_score_skip(per_score_audit, pgs_id, "non_scaffold_contig")
+                    continue
                 pos = int(pos_raw)
                 resolved, reason = resolve_score_row_alleles_for_site(
                     row,
@@ -818,9 +1165,18 @@ def build_union_sites(
                     continue
 
                 key = (chrom, pos, resolved["ref_allele"])
-                entry = site_map.setdefault(key, {"ref": resolved["ref_allele"], "alts": set(), "pgs_ids": set()})
+                if not resolved["alts"]:
+                    skipped += 1
+                    skipped_reasons["effect_only_without_backbone_site"] = skipped_reasons.get("effect_only_without_backbone_site", 0) + 1
+                    increment_score_skip(per_score_audit, pgs_id, "effect_only_without_backbone_site")
+                    continue
+                contig_map = extras_by_contig.setdefault(chrom, {})
+                entry = contig_map.setdefault(key, {"ref": resolved["ref_allele"], "alts": set(), "pgs_ids": set(), "site_source": {"score_extra"}})
+                new_site = len(entry["alts"]) == 0 and len(entry["pgs_ids"]) == 0
                 entry["alts"].update(resolved["alts"])
                 entry["pgs_ids"].add(pgs_id)
+                if new_site:
+                    score_extra_sites += 1
                 per_score_counts[pgs_id] += 1
                 accepted_rows_by_source[resolved["source"]] = accepted_rows_by_source.get(resolved["source"], 0) + 1
                 record_score_accept(per_score_audit, pgs_id, resolved)
@@ -829,25 +1185,60 @@ def build_union_sites(
                 if resolved.get("strand_flipped"):
                     strand_flip_rows += 1
 
-    plain_vcf = targets_root / "pgs_union_sites.vcf"
-    with open(plain_vcf, "w", encoding="utf-8") as out:
-        out.write("##fileformat=VCFv4.2\n")
-        for contig, meta in fasta.index.items():
-            out.write(f"##contig=<ID={contig},length={meta[0]}>\n")
-        out.write("##INFO=<ID=PGS_IDS,Number=.,Type=String,Description=\"PGS IDs contributing to this union site\">\n")
-        out.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
-        for chrom, pos, ref_allele in sorted(site_map.keys(), key=lambda item: (contig_order[item[0]], item[1], item[2])):
-            entry = site_map[(chrom, pos, ref_allele)]
-            alt = ",".join(sorted(entry["alts"])) or "."
-            info = "PGS_IDS=" + ",".join(sorted(entry["pgs_ids"]))
-            out.write(f"{chrom}\t{pos}\t.\t{entry['ref']}\t{alt}\t.\tPASS\t{info}\n")
+    for chrom, contig_map in extras_by_contig.items():
+        rows = [
+            {
+                "chrom": chrom,
+                "pos": pos,
+                "ref": ref_allele,
+                "alts": sorted(entry["alts"]),
+                "pgs_ids": entry["pgs_ids"],
+                "site_source": entry["site_source"],
+            }
+            for (_, pos, ref_allele), entry in sorted(contig_map.items(), key=lambda item: (item[0][1], item[0][2]))
+        ]
+        extras_plain = targets_root / f"{chrom}.score_extra.vcf"
+        write_scaffold_plain_vcf(
+            destination=extras_plain,
+            contigs=[chrom],
+            contig_lengths=contig_lengths,
+            rows=rows,
+        )
+        extra_contig_vcfs.append(compress_vcf(extras_plain, log_path=targets_root / f"{chrom}.score_extra.compress.log"))
+        if chrom not in scaffold_contigs:
+            scaffold_contigs.append(chrom)
 
-    targets_vcf = targets_root / "pgs_union_sites.vcf.gz"
-    run_command(["bcftools", "view", "-Oz", "-o", str(targets_vcf), str(plain_vcf)], check=True)
-    run_command(["bcftools", "index", "-t", str(targets_vcf)], check=True)
+    per_contig_scaffold_vcfs: list[str] = []
+    for chrom in sorted(set(scaffold_contigs), key=lambda item: contig_order.get(item, 10**9)):
+        backbone_vcf = next((path for path in backbone_contig_vcfs if path.name.startswith(f"{chrom}.backbone")), None)
+        extras_vcf = next((path for path in extra_contig_vcfs if path.name.startswith(f"{chrom}.score_extra")), None)
+        contig_output = targets_root / f"{chrom}.scaffold.vcf.gz"
+        merge_scaffold_contig_vcfs(
+            backbone_vcf=backbone_vcf,
+            extras_vcf=extras_vcf,
+            output_vcf=contig_output,
+            log_path=targets_root / f"{chrom}.scaffold.merge.log",
+        )
+        per_contig_scaffold_vcfs.append(str(contig_output))
 
+    targets_vcf = targets_root / "pgs_scaffold_sites.vcf.gz"
+    if not complete_artifact(targets_vcf):
+        remove_if_exists(targets_vcf, f"{targets_vcf}.tbi")
+        run_command(
+            ["bcftools", "concat", "-a", "-Oz", "-o", str(targets_vcf), *per_contig_scaffold_vcfs],
+            check=True,
+            log_path=targets_root / "scaffold.concat.log",
+        )
+        run_command(["tabix", "-f", "-p", "vcf", str(targets_vcf)], check=True, log_path=targets_root / "scaffold.concat.index.log")
+
+    scaffold_site_count = int((run_command(["bcftools", "index", "-n", str(targets_vcf)], check=True).stdout or "0").strip())
     summary = {
-        "union_sites": len(site_map),
+        "reference_db": reference_db["reference_db_id"],
+        "scaffold_sites": scaffold_site_count,
+        "union_sites": scaffold_site_count,
+        "backbone_sites": backbone_sites,
+        "backbone_base_chromosomes": backbone_base_chromosomes,
+        "score_extra_sites": score_extra_sites,
         "skipped_rows": skipped,
         "skipped_reasons": skipped_reasons,
         "per_score_counts": per_score_counts,
@@ -871,7 +1262,8 @@ def build_union_sites(
         "artifacts": {
             "targets_vcf": str(targets_vcf),
             "targets_vcf_index": str(targets_vcf) + ".tbi",
-            "plain_vcf": str(plain_vcf),
+            "reference_db_archive": reference_db["archive_path"],
+            "reference_db_root": reference_db["extracted_root"],
             **diagnostic_artifacts,
         },
     }
@@ -906,9 +1298,9 @@ def build_dense_prs_shard(
 ) -> dict[str, Any]:
     shard_dir = ensure_dir(stage_root / "dense" / "shards" / shard["name"])
     log_dir = ensure_dir(stage_root / "logs")
-    shard_targets = shard_dir / f"{shard['name']}.targets.vcf.gz"
-    gvcf = shard_dir / f"{sample_id}.{shard['name']}.g.vcf.gz"
-    dense_vcf = shard_dir / f"{sample_id}.{shard['name']}.dense.vcf.gz"
+    shard_targets = shard_dir / f"{shard['name']}.scaffold.targets.vcf.gz"
+    gvcf = shard_dir / f"{sample_id}.{shard['name']}.scaffold.g.vcf.gz"
+    dense_vcf = shard_dir / f"{sample_id}.{shard['name']}.scaffold.vcf.gz"
     region_arg = ",".join(shard["intervals"])
     shard_targets_reused = complete_artifact(shard_targets)
     gvcf_reused = complete_artifact(gvcf)
@@ -944,10 +1336,10 @@ def build_dense_prs_shard(
                     "HaplotypeCaller",
                     "-R", f"/ref/{reference_fasta.name}",
                     "-I", f"/input/{cram_path.name}",
-                    "-L", f"/out/dense/shards/{shard['name']}/{shard_targets.name}",
                     "-O", f"/out/dense/shards/{shard['name']}/{gvcf.name}",
                     "-ERC", "GVCF",
                     "--native-pair-hmm-threads", str(pairhmm_threads),
+                    *[item for interval in shard["intervals"] for item in ("-L", interval)],
                 ],
                 docker_bin=docker_bin,
             ),
@@ -957,30 +1349,16 @@ def build_dense_prs_shard(
 
     if not dense_vcf_reused:
         remove_if_exists(dense_vcf, f"{dense_vcf}.tbi")
-        run_command(
-            build_docker_run_command(
-                image=GATK_IMAGE,
-                mounts={
-                    cram_path.parent: "/input",
-                    reference_fasta.parent: "/ref",
-                    stage_root: "/out",
-                },
-                inner_args=[
-                    "gatk",
-                    "--java-options",
-                    f"-Xmx{java_memory}",
-                    "GenotypeGVCFs",
-                    "-R", f"/ref/{reference_fasta.name}",
-                    "-V", f"/out/dense/shards/{shard['name']}/{gvcf.name}",
-                    "-L", f"/out/dense/shards/{shard['name']}/{shard_targets.name}",
-                    "--include-non-variant-sites",
-                    "-O", f"/out/dense/shards/{shard['name']}/{dense_vcf.name}",
-                ],
-                docker_bin=docker_bin,
-            ),
-            check=True,
-            log_path=log_dir / f"{shard['name']}.genotypegvcfs.log",
+        pipeline = (
+            "set -euo pipefail; "
+            f"bcftools convert --no-version --gvcf2vcf --fasta-ref {shlex.quote(str(reference_fasta))} {shlex.quote(str(gvcf))} "
+            f"| bcftools annotate --no-version --remove QUAL,INFO,^FORMAT/GT "
+            f"| bcftools view --no-version --targets-file {shlex.quote(str(shard_targets))} --targets-overlap 2 --trim-alt-alleles --no-update "
+            f"| bcftools norm --no-version --rm-dup all --check-ref s --fasta-ref {shlex.quote(str(reference_fasta))} "
+            f"| bcftools sort -Oz -o {shlex.quote(str(dense_vcf))}; "
+            f"tabix -f -p vcf {shlex.quote(str(dense_vcf))}"
         )
+        run_command(["bash", "-lc", pipeline], check=True, log_path=log_dir / f"{shard['name']}.scaffold.log")
     return {
         "shard_name": shard["name"],
         "dense_vcf": str(dense_vcf),
@@ -994,8 +1372,8 @@ def build_dense_prs_shard(
 
 
 def concat_dense_vcf(stage_root: pathlib.Path, reference_fasta: pathlib.Path, sample_id: str, dense_shards: list[str]) -> str:
-    concat_vcf = stage_root / "dense" / f"{sample_id}.prs_dense.concat.vcf.gz"
-    final_vcf = stage_root / "dense" / f"{sample_id}.prs_dense.vcf.gz"
+    concat_vcf = stage_root / "dense" / f"{sample_id}.prs_scaffold.concat.vcf.gz"
+    final_vcf = stage_root / "dense" / f"{sample_id}.prs_scaffold.vcf.gz"
     log_dir = ensure_dir(stage_root / "logs")
     if not complete_artifact(concat_vcf):
         remove_if_exists(concat_vcf, f"{concat_vcf}.tbi")
@@ -1012,7 +1390,7 @@ def concat_dense_vcf(stage_root: pathlib.Path, reference_fasta: pathlib.Path, sa
     if not complete_artifact(final_vcf):
         remove_if_exists(final_vcf, f"{final_vcf}.tbi")
         run_command(
-            ["bcftools", "norm", "-f", str(reference_fasta), "-m", "-both", "-Oz", "-o", str(final_vcf), str(concat_vcf)],
+            ["bcftools", "norm", "-f", str(reference_fasta), "--rm-dup", "exact", "-Oz", "-o", str(final_vcf), str(concat_vcf)],
             check=True,
             log_path=log_dir / "dense.norm.log",
         )
@@ -1026,6 +1404,17 @@ def concat_dense_vcf(stage_root: pathlib.Path, reference_fasta: pathlib.Path, sa
 
 def filter_imputed_expression(info_threshold: float) -> str:
     return f"(INFO/IMP=1 && INFO/DR2>={info_threshold}) || INFO/IMP=0"
+
+
+def beagle_failed_due_to_no_common_markers(error: subprocess.CalledProcessError) -> bool:
+    combined = "\n".join(part for part in [error.output, error.stderr] if part)
+    return "no markers in common" in combined.lower()
+
+
+def beagle_log_has_no_common_markers(log_path: pathlib.Path) -> bool:
+    if not log_path.exists():
+        return False
+    return "no markers in common" in log_path.read_text(encoding="utf-8", errors="replace").lower()
 
 
 def build_imputation_shards(context: dict[str, Any], dense_vcf: pathlib.Path, panel: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1301,8 +1690,26 @@ def build_imputed_prs_shard(
     )
     beagle_out_prefix = shard_dir / f"{context['sample_id']}.{shard['name']}.beagle"
     beagle_vcf = pathlib.Path(str(beagle_out_prefix) + ".vcf.gz")
-    if not beagle_vcf.exists():
-        remove_if_exists(beagle_vcf, shard_dir / f"{beagle_out_prefix.name}.log")
+    beagle_log = shard_dir / f"{shard['name']}.beagle.log"
+    if beagle_log_has_no_common_markers(beagle_log):
+        remove_if_exists(beagle_vcf)
+        passthrough_vcf, passthrough_reused = build_dense_passthrough_shard(
+            dense_vcf=dense_vcf,
+            shard_dir=shard_dir,
+            shard_name=shard["name"],
+            sample_id=context["sample_id"],
+            region_arg=region_arg,
+        )
+        return {
+            "shard_name": shard["name"],
+            "mode": "passthrough",
+            "output_vcf": str(passthrough_vcf),
+            "reused": passthrough_reused,
+            "panel_chrom": shard["panel_resource"]["panel_chrom"],
+            "passthrough_reason": "no_panel_overlap_window",
+        }
+    if not beagle_vcf.exists() or beagle_vcf.stat().st_size == 0:
+        remove_if_exists(beagle_vcf, beagle_log)
         args = [
             "java",
             f"-Xmx{java_memory}",
@@ -1316,11 +1723,31 @@ def build_imputed_prs_shard(
         ]
         if panel_resources["map"] is not None:
             args.append(f"map={panel_resources['map']}")
-        run_command(
-            args,
-            check=True,
-            log_path=shard_dir / f"{shard['name']}.beagle.log",
-        )
+        try:
+            run_command(
+                args,
+                check=True,
+                log_path=beagle_log,
+            )
+        except subprocess.CalledProcessError as error:
+            if not beagle_failed_due_to_no_common_markers(error):
+                raise
+            remove_if_exists(beagle_vcf)
+            passthrough_vcf, passthrough_reused = build_dense_passthrough_shard(
+                dense_vcf=dense_vcf,
+                shard_dir=shard_dir,
+                shard_name=shard["name"],
+                sample_id=context["sample_id"],
+                region_arg=region_arg,
+            )
+            return {
+                "shard_name": shard["name"],
+                "mode": "passthrough",
+                "output_vcf": str(passthrough_vcf),
+                "reused": passthrough_reused,
+                "panel_chrom": shard["panel_resource"]["panel_chrom"],
+                "passthrough_reason": "no_panel_overlap_window",
+            }
 
     renamed_back = rename_contig_for_panel(
         input_vcf=beagle_vcf,
@@ -1598,7 +2025,7 @@ def build_pgsc_input_pfile(
             "--threads", str(thread_count),
             "--memory", str(memory_mb),
             "--set-all-var-ids", "@:#:$r:$a",
-            "--new-id-max-allele-len", "256",
+            "--new-id-max-allele-len", "512",
             "--max-alleles", "2",
         ]
         if sex_code:
@@ -1636,11 +2063,13 @@ def build_pgsc_input_pfile(
         )
 
     return {
+        "format": "pfile",
         "path_prefix": str(output_prefix),
         "input_kind": input_kind,
         "dosage_field": dosage_field,
         "sample_sex": context["manifest"]["analysis"]["prs"].get("sample_sex"),
         "sex_chromosomes_included": bool(sex_code),
+        "renamed_chr_prefix": None,
         "artifacts": {
             "pgen": str(output_prefix) + ".pgen",
             "psam": str(output_prefix) + ".psam",
@@ -1648,6 +2077,97 @@ def build_pgsc_input_pfile(
             "log": str(log_path),
         },
     }
+
+
+def prepare_pgscalc_vcf_input(
+    *,
+    context: dict[str, Any],
+    stage_root: pathlib.Path,
+    input_vcf: pathlib.Path,
+) -> dict[str, Any]:
+    scoring_root = ensure_dir(stage_root / "vcf_input")
+    log_path = scoring_root / "normalize.log"
+    normalized_vcf = scoring_root / "pgsc_calc_input.vcf.gz"
+    contigs = [line.strip() for line in run_command(["tabix", "-l", str(input_vcf)], check=True).stdout.splitlines() if line.strip()]
+    rename_map = scoring_root / "rename_chrs.tsv"
+
+    renamed = False
+    rename_lines = []
+    for contig in contigs:
+        if contig.startswith("chr"):
+            rename_lines.append(f"{contig}\t{contig[3:]}\n")
+            renamed = True
+    if renamed:
+        rename_map.write_text("".join(rename_lines), encoding="utf-8")
+
+    if not complete_artifact(normalized_vcf):
+        remove_if_exists(normalized_vcf, f"{normalized_vcf}.tbi")
+        command = ["bcftools", "view", "-Oz", "-o", str(normalized_vcf), str(input_vcf)]
+        if renamed:
+            command = [
+                "bcftools",
+                "annotate",
+                "--rename-chrs",
+                str(rename_map),
+                "-Oz",
+                "-o",
+                str(normalized_vcf),
+                str(input_vcf),
+            ]
+        run_command(command, check=True, log_path=log_path)
+        run_command(["tabix", "-f", "-p", "vcf", str(normalized_vcf)], check=True, log_path=scoring_root / "normalize.index.log")
+
+    return {
+        "format": "vcf",
+        "path": str(normalized_vcf),
+        "path_prefix": str(strip_vcf_suffix(normalized_vcf)),
+        "renamed_chr_prefix": renamed,
+        "contigs": [line[4:].strip() if line.startswith("chr") else line for line in contigs],
+        "artifacts": {
+            "normalized_vcf": str(normalized_vcf),
+            "normalized_vcf_index": str(normalized_vcf) + ".tbi",
+            "rename_map": str(rename_map) if renamed else None,
+        },
+    }
+
+
+def build_pgsc_calc_samplesheet(
+    *,
+    sampleset: str,
+    scoring_input_info: dict[str, Any],
+    dosage_field: str | None = None,
+) -> str:
+    header = ["sampleset", "path_prefix", "chrom", "format"]
+    row = [sampleset, scoring_input_info["path_prefix"], "", scoring_input_info["format"]]
+    if scoring_input_info["format"] == "vcf" and dosage_field:
+        header.append("vcf_genotype_field")
+        row.append(dosage_field)
+    return ",".join(header) + "\n" + ",".join(row) + "\n"
+
+
+def build_pgsc_calc_resource_config(*, max_memory: str, match_cpus: int = 1, score_cpus: int = 1) -> str:
+    return "\n".join(
+        [
+            "process {",
+            "  withName: 'PGSCATALOG_PGSCCALC:PGSCCALC:MATCH:MATCH_VARIANTS' {",
+            f"    cpus = {match_cpus}",
+            f"    memory = '{max_memory}'",
+            "    time = '24.h'",
+            "  }",
+            "  withName: 'PGSCATALOG_PGSCCALC:PGSCCALC:APPLY_SCORE:PLINK2_SCORE' {",
+            f"    cpus = {score_cpus}",
+            f"    memory = '{max_memory}'",
+            "    time = '24.h'",
+            "  }",
+            "  withName: 'PGSCATALOG_PGSCCALC:PGSCCALC:APPLY_SCORE:SCORE_AGGREGATE' {",
+            f"    cpus = {score_cpus}",
+            f"    memory = '{max_memory}'",
+            "    time = '24.h'",
+            "  }",
+            "}",
+            "",
+        ]
+    )
 
 
 def run_pgsc_calc(
@@ -1661,11 +2181,12 @@ def run_pgsc_calc(
     ids = context["manifest"]["analysis"]["prs"]["pgs_ids"]
     samplesheet = stage_root / "samplesheet.csv"
     ids_file = stage_root / "pgs_ids.txt"
-    outdir = ensure_dir(stage_root / "pgsc_calc")
-    workdir = ensure_dir(stage_root / "work")
+    outdir = stage_root / "pgsc_calc"
+    workdir = stage_root / "work"
     genotypes_cache = ensure_dir(stage_root / "genotypes_cache")
     log_path = stage_root / "pgsc_calc.log"
-    pfile_info = build_pgsc_input_pfile(
+    nested_config = stage_root / "pgsc_calc.resources.config"
+    scoring_input_info = build_pgsc_input_pfile(
         context=context,
         stage_root=stage_root,
         input_vcf=scoring_vcf,
@@ -1674,17 +2195,32 @@ def run_pgsc_calc(
     )
 
     samplesheet.write_text(
-        "sampleset,path_prefix,chrom,format\n"
-        f"{safe_sampleset_name(context['sample_id'])},{pfile_info['path_prefix']},,pfile\n",
+        build_pgsc_calc_samplesheet(
+            sampleset=safe_sampleset_name(context["sample_id"]),
+            scoring_input_info=scoring_input_info,
+            dosage_field=dosage_field,
+        ),
         encoding="utf-8",
     )
     ids_file.write_text("\n".join(ids) + "\n", encoding="utf-8")
+
+    for path in (outdir, workdir):
+        if path.exists():
+            shutil.rmtree(path)
+    ensure_dir(outdir)
+    ensure_dir(workdir)
+    remove_if_exists(log_path)
+    nested_config.write_text(
+        build_pgsc_calc_resource_config(max_memory=context["manifest"]["runtime"]["max_memory"]),
+        encoding="utf-8",
+    )
 
     args = [
         "nextflow",
         "run",
         "pgscatalog/pgsc_calc",
         "-profile", context["manifest"]["runtime"]["profile"],
+        "-c", str(nested_config),
         "--input", str(samplesheet),
         "--pgs_id", ",".join(ids),
         "--target_build", "GRCh38",
@@ -1693,14 +2229,16 @@ def run_pgsc_calc(
         "--outdir", str(outdir),
         "--genotypes_cache", str(genotypes_cache),
         "-work-dir", str(workdir),
-        "-resume",
     ]
+    if context["manifest"]["analysis"]["prs"].get("run_ancestry"):
+        reference_db = ensure_reference_db_assets(context)
+        args.extend(["--run_ancestry", reference_db["archive_path"]])
 
     env = {
         "NXF_HOME": context["runtime"]["nextflow_home"],
     }
     completed = run_command(args, cwd=context["repo_root"], env=env, log_path=log_path, check=False)
-    return completed.returncode, log_path, pfile_info
+    return completed.returncode, log_path, scoring_input_info
 
 
 def find_first(root: pathlib.Path, pattern: str) -> str | None:
@@ -1715,12 +2253,22 @@ def load_existing_stage(stage_manifest_path: pathlib.Path, cache_key: str) -> di
     if payload.get("cache_key") != cache_key or payload.get("status") != "ok":
         return None
     artifacts = payload.get("artifacts") or {}
+    has_scoring_surface = complete_artifacts_exist(
+        [
+            artifacts.get("normalized_scoring_input_vcf"),
+        ]
+    ) or complete_artifacts_exist(
+        [
+            artifacts.get("scoring_input_pgen"),
+            artifacts.get("scoring_input_psam"),
+            artifacts.get("scoring_input_pvar"),
+        ]
+    )
+    if not has_scoring_surface:
+        return None
     required_artifacts = [
         artifacts.get("aggregated_scores"),
         artifacts.get("scoring_input_vcf"),
-        artifacts.get("compatible_pgen"),
-        artifacts.get("compatible_psam"),
-        artifacts.get("compatible_pvar"),
     ]
     if not complete_artifacts_exist(required_artifacts):
         return None
@@ -1824,7 +2372,7 @@ def main() -> None:
             union_stage = build_union_sites(context=context, stage_root=stage_root, reference_fasta=reference_fasta, reference_fai=reference_fai)
             score_hash = union_stage["score_hash"]
             dense_root = ensure_dir(stage_root / score_hash)
-            dense_vcf = dense_root / "dense" / f"{context['sample_id']}.prs_dense.vcf.gz"
+            dense_vcf = dense_root / "dense" / f"{context['sample_id']}.prs_scaffold.vcf.gz"
 
             if complete_artifact(dense_vcf):
                 dense_info = stage_payload(
@@ -1838,6 +2386,7 @@ def main() -> None:
                         "dense_vcf_index": str(dense_vcf) + ".tbi",
                         "targets_vcf": union_stage["artifacts"]["targets_vcf"],
                         "targets_vcf_index": union_stage["artifacts"]["targets_vcf_index"],
+                        "reference_db_archive": union_stage["artifacts"].get("reference_db_archive"),
                         "pre_match_audit_json": union_stage["artifacts"].get("pre_match_audit_json"),
                         "pre_match_audit_tsv": union_stage["artifacts"].get("pre_match_audit_tsv"),
                     },
@@ -1875,6 +2424,7 @@ def main() -> None:
                     artifacts={
                         "targets_vcf": union_stage["artifacts"]["targets_vcf"],
                         "targets_vcf_index": union_stage["artifacts"]["targets_vcf_index"],
+                        "reference_db_archive": union_stage["artifacts"].get("reference_db_archive"),
                         "pre_match_audit_json": union_stage["artifacts"].get("pre_match_audit_json"),
                         "pre_match_audit_tsv": union_stage["artifacts"].get("pre_match_audit_tsv"),
                     },
@@ -1926,6 +2476,7 @@ def main() -> None:
                         "dense_vcf_index": dense_vcf_path + ".tbi",
                         "targets_vcf": union_stage["artifacts"]["targets_vcf"],
                         "targets_vcf_index": union_stage["artifacts"]["targets_vcf_index"],
+                        "reference_db_archive": union_stage["artifacts"].get("reference_db_archive"),
                         "pre_match_audit_json": union_stage["artifacts"].get("pre_match_audit_json"),
                         "pre_match_audit_tsv": union_stage["artifacts"].get("pre_match_audit_tsv"),
                     },
@@ -1975,6 +2526,7 @@ def main() -> None:
                 scoring_input_kind,
                 str(scoring_input_fingerprint),
                 str(cfg.get("sample_sex") or "autosome_only"),
+                str(cfg.get("run_ancestry") or False),
             ]
         )
         reused = load_existing_stage(stage_manifest_path, cache_key)
@@ -1990,6 +2542,19 @@ def main() -> None:
             input_kind=scoring_input_kind,
             dosage_field=dosage_field,
         )
+        scoring_vcf_info = pfile_info
+        scoring_input_artifacts = {
+            "scoring_input_vcf": scoring_input_path,
+            "scoring_input_index": scoring_input_index,
+            "scoring_input_format": scoring_vcf_info.get("format"),
+            "scoring_input_pgen": scoring_vcf_info["artifacts"].get("pgen"),
+            "scoring_input_psam": scoring_vcf_info["artifacts"].get("psam"),
+            "scoring_input_pvar": scoring_vcf_info["artifacts"].get("pvar"),
+            "scoring_input_pfile_log": scoring_vcf_info["artifacts"].get("log"),
+            "normalized_scoring_input_vcf": scoring_vcf_info["artifacts"].get("normalized_vcf"),
+            "normalized_scoring_input_vcf_index": scoring_vcf_info["artifacts"].get("normalized_vcf_index"),
+            "scoring_input_rename_map": scoring_vcf_info["artifacts"].get("rename_map"),
+        }
         log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
         aggregated_scores = find_first(scoring_root / "pgsc_calc", "aggregated_scores.txt.gz")
         report_html = find_first(scoring_root / "pgsc_calc", "report.html")
@@ -2016,14 +2581,14 @@ def main() -> None:
                     "exit_code": exit_code,
                     "overlap_failures": overlap_failures,
                     "log_path": str(log_path),
-                    "sample_sex": pfile_info["sample_sex"],
-                    "sex_chromosomes_included": pfile_info["sex_chromosomes_included"],
+                    "sample_sex": cfg.get("sample_sex"),
+                    "sex_chromosomes_included": bool(cfg.get("sample_sex")),
                     "scoring_input_kind": scoring_input_kind,
-                    "dosage_field": pfile_info.get("dosage_field"),
+                    "pgsc_input_format": scoring_vcf_info.get("format"),
+                    "dosage_field": dosage_field,
+                    "renamed_chr_prefix": scoring_vcf_info["renamed_chr_prefix"],
                 },
                 artifacts={
-                    "scoring_input_vcf": scoring_input_path,
-                    "scoring_input_index": scoring_input_index,
                     "dense_vcf": dense_info["artifacts"]["dense_vcf"] if dense_info else None,
                     "dense_vcf_index": dense_info["artifacts"]["dense_vcf_index"] if dense_info else None,
                     "targets_vcf": dense_info["artifacts"].get("targets_vcf") if dense_info else None,
@@ -2032,12 +2597,9 @@ def main() -> None:
                     "pre_match_audit_tsv": dense_info["artifacts"].get("pre_match_audit_tsv") if dense_info else None,
                     "imputed_vcf": imputed_info["artifacts"]["imputed_vcf"] if imputed_info else None,
                     "imputed_vcf_index": imputed_info["artifacts"]["imputed_vcf_index"] if imputed_info else None,
-                    "compatible_pgen": pfile_info["artifacts"]["pgen"],
-                    "compatible_psam": pfile_info["artifacts"]["psam"],
-                    "compatible_pvar": pfile_info["artifacts"]["pvar"],
-                    "compatible_plink_log": pfile_info["artifacts"]["log"],
                     "pgsc_outdir": str(scoring_root / "pgsc_calc"),
                     "pgsc_log": str(log_path),
+                    **scoring_input_artifacts,
                     **match_diagnostic_artifacts,
                 },
             )
@@ -2068,13 +2630,13 @@ def main() -> None:
                 "union_sites": (dense_info.get("summary") or {}).get("union_sites") if dense_info else None,
                 "preview_rows": preview_rows,
                 "overlap_failures": overlap_failures,
-                "sample_sex": pfile_info["sample_sex"],
-                "sex_chromosomes_included": pfile_info["sex_chromosomes_included"],
+                "sample_sex": cfg.get("sample_sex"),
+                "sex_chromosomes_included": bool(cfg.get("sample_sex")),
                 "scoring_input_kind": scoring_input_kind,
+                "pgsc_input_format": scoring_vcf_info.get("format"),
+                "renamed_chr_prefix": scoring_vcf_info["renamed_chr_prefix"],
             },
             artifacts={
-                "scoring_input_vcf": scoring_input_path,
-                "scoring_input_index": scoring_input_index,
                 "dense_vcf": dense_info["artifacts"]["dense_vcf"] if dense_info else None,
                 "dense_vcf_index": dense_info["artifacts"]["dense_vcf_index"] if dense_info else None,
                 "targets_vcf": dense_info["artifacts"].get("targets_vcf") if dense_info else None,
@@ -2083,15 +2645,12 @@ def main() -> None:
                 "pre_match_audit_tsv": dense_info["artifacts"].get("pre_match_audit_tsv") if dense_info else None,
                 "imputed_vcf": imputed_info["artifacts"]["imputed_vcf"] if imputed_info else None,
                 "imputed_vcf_index": imputed_info["artifacts"]["imputed_vcf_index"] if imputed_info else None,
-                "compatible_pgen": pfile_info["artifacts"]["pgen"],
-                "compatible_psam": pfile_info["artifacts"]["psam"],
-                "compatible_pvar": pfile_info["artifacts"]["pvar"],
-                "compatible_plink_log": pfile_info["artifacts"]["log"],
                 "aggregated_scores": aggregated_scores,
                 "pgsc_report_html": report_html,
                 "match_summary": match_summary,
                 "pgsc_outdir": str(scoring_root / "pgsc_calc"),
                 "pgsc_log": str(log_path),
+                **scoring_input_artifacts,
                 **match_diagnostic_artifacts,
             },
         )

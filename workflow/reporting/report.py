@@ -58,6 +58,7 @@ def publish_stage_artifacts(
     prs_imputed_artifacts = (prs_stage.get("imputed_genotypes") or {}).get("artifacts") or {}
     dense_artifacts = (prs_stage.get("dense_genotypes") or {}).get("artifacts") or {}
     for source_key, filename in [
+        ("dense_vcf", "prs_scaffold.vcf.gz"),
         ("aggregated_scores", "aggregated_scores.txt.gz"),
         ("pgsc_report_html", "pgsc_report.html"),
         ("match_summary", "match_summary.csv"),
@@ -65,7 +66,7 @@ def publish_stage_artifacts(
         ("overlap_failures_tsv", "overlap_failures.tsv"),
         ("imputed_vcf", "imputed_prs.vcf.gz"),
     ]:
-        source = prs_artifacts.get(source_key) or prs_imputed_artifacts.get(source_key)
+        source = dense_artifacts.get(source_key) or prs_artifacts.get(source_key) or prs_imputed_artifacts.get(source_key)
         if not source:
             continue
         destination = prs_dir / filename
@@ -174,7 +175,7 @@ def render_report(
         out.write(f"- Reference probe: `{reference_probe.get('status', 'unknown')}`\n")
         out.write(f"- Reference bundle: `{reference_stage.get('status', 'unknown')}`\n")
         out.write(f"- Monogenic stage: `{monogenic_stage.get('status', 'unknown')}`\n")
-        out.write(f"- PRS dense genotypes: `{prs_dense.get('status', 'unknown')}`\n")
+        out.write(f"- PRS scaffold stage: `{prs_dense.get('status', 'unknown')}`\n")
         out.write(f"- PRS stage: `{prs_stage.get('status', 'unknown')}`\n\n")
 
         out.write("## Inputs And Runtime\n")
@@ -238,12 +239,18 @@ def render_report(
         if prs_enabled:
             out.write("## PRS\n")
             if prs_dense:
-                out.write(f"- Dense genotype stage status: `{prs_dense.get('status', 'unknown')}`\n")
+                out.write(f"- Scaffold stage status: `{prs_dense.get('status', 'unknown')}`\n")
                 import_details = prs_dense.get("import_details")
-                render_import_details(out, import_details, prefix="Dense genotype import")
+                render_import_details(out, import_details, prefix="Scaffold import")
                 dense_summary = prs_dense.get("summary") or {}
-                if dense_summary.get("union_sites") is not None:
-                    out.write(f"- Union sites requested: `{dense_summary['union_sites']}`\n")
+                if dense_summary.get("reference_db"):
+                    out.write(f"- Reference DB backbone: `{dense_summary['reference_db']}`\n")
+                if dense_summary.get("scaffold_sites") is not None:
+                    out.write(f"- Scaffold sites requested: `{dense_summary['scaffold_sites']}`\n")
+                if dense_summary.get("backbone_sites") is not None:
+                    out.write(f"- Backbone sites requested: `{dense_summary['backbone_sites']}`\n")
+                if dense_summary.get("score_extra_sites") is not None:
+                    out.write(f"- Score-extra sites requested: `{dense_summary['score_extra_sites']}`\n")
                 if dense_summary.get("accepted_strand_flip_rows") is not None:
                     out.write(f"- Accepted rows rescued by strand complement: `{dense_summary['accepted_strand_flip_rows']}`\n")
                 accepted_rows_by_source = dense_summary.get("accepted_rows_by_source") or {}
@@ -262,9 +269,11 @@ def render_report(
                     )
                 dense_artifacts = prs_dense.get("artifacts") or {}
                 if dense_artifacts.get("dense_vcf"):
-                    out.write(f"- Dense PRS VCF: `{dense_artifacts['dense_vcf']}`\n")
+                    out.write(f"- PRS scaffold VCF: `{dense_artifacts['dense_vcf']}`\n")
                 if dense_artifacts.get("targets_vcf"):
-                    out.write(f"- Union targets VCF: `{dense_artifacts['targets_vcf']}`\n")
+                    out.write(f"- Scaffold targets VCF: `{dense_artifacts['targets_vcf']}`\n")
+                if dense_artifacts.get("reference_db_archive"):
+                    out.write(f"- Reference DB archive: `{dense_artifacts['reference_db_archive']}`\n")
                 if dense_artifacts.get("pre_match_audit_tsv"):
                     out.write(f"- Pre-match audit TSV: `{dense_artifacts['pre_match_audit_tsv']}`\n")
                 if dense_artifacts.get("pre_match_audit_json"):
@@ -292,11 +301,23 @@ def render_report(
                 artifacts = prs_stage.get("artifacts") or {}
                 summary = prs_stage.get("summary") or {}
                 out.write(f"- Scoring input kind: `{summary.get('scoring_input_kind', 'unknown')}`\n")
+                if summary.get("pgsc_input_format"):
+                    out.write(f"- pgsc_calc input format: `{summary.get('pgsc_input_format')}`\n")
+                if summary.get("renamed_chr_prefix") is not None:
+                    out.write(f"- Scoring contigs normalized for pgsc_calc: `{summary.get('renamed_chr_prefix')}`\n")
                 out.write(f"- Aggregated scores: `{artifacts.get('aggregated_scores', 'n/a')}`\n")
                 if artifacts.get("pgsc_report_html"):
                     out.write(f"- pgsc_calc HTML report: `{artifacts['pgsc_report_html']}`\n")
                 if artifacts.get("match_diagnostics_json"):
                     out.write(f"- Match diagnostics JSON: `{artifacts['match_diagnostics_json']}`\n")
+                if artifacts.get("scoring_input_pgen"):
+                    out.write(f"- Scoring input PGEN: `{artifacts['scoring_input_pgen']}`\n")
+                if artifacts.get("scoring_input_psam"):
+                    out.write(f"- Scoring input PSAM: `{artifacts['scoring_input_psam']}`\n")
+                if artifacts.get("scoring_input_pvar"):
+                    out.write(f"- Scoring input PVAR: `{artifacts['scoring_input_pvar']}`\n")
+                if artifacts.get("normalized_scoring_input_vcf"):
+                    out.write(f"- Normalized scoring VCF: `{artifacts['normalized_scoring_input_vcf']}`\n")
                 if artifacts.get("overlap_failures_tsv"):
                     out.write(f"- Match threshold summary TSV: `{artifacts['overlap_failures_tsv']}`\n")
                 if prs_rows:
@@ -312,8 +333,20 @@ def render_report(
                     out.write(f"- Detail: {prs_stage['message']}\n")
                 if diagnostics.get("scoring_input_kind"):
                     out.write(f"- Scoring input kind: `{diagnostics['scoring_input_kind']}`\n")
+                if diagnostics.get("pgsc_input_format"):
+                    out.write(f"- pgsc_calc input format: `{diagnostics['pgsc_input_format']}`\n")
+                if diagnostics.get("renamed_chr_prefix") is not None:
+                    out.write(f"- Scoring contigs normalized for pgsc_calc: `{diagnostics['renamed_chr_prefix']}`\n")
                 if artifacts.get("match_diagnostics_json"):
                     out.write(f"- Match diagnostics JSON: `{artifacts['match_diagnostics_json']}`\n")
+                if artifacts.get("scoring_input_pgen"):
+                    out.write(f"- Scoring input PGEN: `{artifacts['scoring_input_pgen']}`\n")
+                if artifacts.get("scoring_input_psam"):
+                    out.write(f"- Scoring input PSAM: `{artifacts['scoring_input_psam']}`\n")
+                if artifacts.get("scoring_input_pvar"):
+                    out.write(f"- Scoring input PVAR: `{artifacts['scoring_input_pvar']}`\n")
+                if artifacts.get("normalized_scoring_input_vcf"):
+                    out.write(f"- Normalized scoring VCF: `{artifacts['normalized_scoring_input_vcf']}`\n")
                 if artifacts.get("overlap_failures_tsv"):
                     out.write(f"- Match threshold summary TSV: `{artifacts['overlap_failures_tsv']}`\n")
                 if artifacts.get("match_summary"):
@@ -332,7 +365,7 @@ def render_report(
         out.write("## Limitations\n")
         out.write("- Research use only; this pipeline does not produce clinical diagnoses.\n")
         out.write("- Monogenic and PRS stages reuse imported artifacts only at explicit stage boundaries.\n")
-        out.write("- PRS is generated from a dense genotype VCF derived from the CRAM, not from a sparse hard-filtered WGS VCF.\n")
+        out.write("- PRS is generated from a broad scaffold VCF derived from the CRAM, with optional scaffold-based imputation before scoring.\n")
         out.write("- CRAM-based stages require the exact matching reference bundle.\n\n")
 
         out.write("## Artifacts\n")

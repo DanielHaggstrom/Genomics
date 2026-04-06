@@ -46,6 +46,7 @@ class ValidateManifestTests(unittest.TestCase):
         self.assertIsNone(manifest["analysis"]["monogenic"]["pairhmm_threads"])
         self.assertIsNone(manifest["analysis"]["prs"]["workers"])
         self.assertIsNone(manifest["analysis"]["prs"]["pairhmm_threads"])
+        self.assertEqual(manifest["analysis"]["prs"]["reference_db"], "pgsc_HGDP+1kGP_v1")
         self.assertFalse(manifest["analysis"]["prs"]["imputation"]["enabled"])
         self.assertEqual(manifest["analysis"]["prs"]["imputation"]["backend"], "beagle")
         self.assertEqual(manifest["analysis"]["prs"]["imputation"]["dosage_field"], "DS")

@@ -102,7 +102,10 @@ class RenderReportTests(unittest.TestCase):
                 "dense_genotypes": {
                     "status": "ok",
                     "summary": {
-                        "union_sites": 12345,
+                        "reference_db": "pgsc_HGDP+1kGP_v1",
+                        "scaffold_sites": 12345,
+                        "backbone_sites": 12000,
+                        "score_extra_sites": 345,
                         "accepted_strand_flip_rows": 222,
                         "accepted_rows_by_source": {
                             "explicit_other_allele": 12000,
@@ -116,6 +119,7 @@ class RenderReportTests(unittest.TestCase):
                     "artifacts": {
                         "dense_vcf": str(tmp / "cache" / "dense.vcf.gz"),
                         "targets_vcf": str(tmp / "cache" / "targets.vcf.gz"),
+                        "reference_db_archive": str(tmp / "cache" / "pgsc_HGDP+1kGP_v1.tar.zst"),
                         "pre_match_audit_tsv": str(tmp / "cache" / "pre_match_audit.tsv"),
                         "pre_match_audit_json": str(tmp / "cache" / "pre_match_audit.json"),
                     },
@@ -150,6 +154,15 @@ class RenderReportTests(unittest.TestCase):
                     "overlap_failures_tsv": str(tmp / "cache" / "overlap_failures.tsv"),
                     "match_summary": str(tmp / "cache" / "match_summary.csv"),
                     "pgsc_report_html": str(tmp / "cache" / "pgsc_report.html"),
+                    "scoring_input_pgen": str(tmp / "cache" / "scoring_input.pgen"),
+                    "scoring_input_psam": str(tmp / "cache" / "scoring_input.psam"),
+                    "scoring_input_pvar": str(tmp / "cache" / "scoring_input.pvar.zst"),
+                    "normalized_scoring_input_vcf": str(tmp / "cache" / "normalized_scoring.vcf.gz"),
+                },
+                "summary": {
+                    "scoring_input_kind": "imputed_vcf",
+                    "pgsc_input_format": "pfile",
+                    "renamed_chr_prefix": True,
                 },
             }
 
@@ -162,17 +175,24 @@ class RenderReportTests(unittest.TestCase):
                 Path(monogenic["artifacts"]["review_unique_tsv"]),
                 Path(monogenic["artifacts"]["priority_summary"]),
                 Path(monogenic["artifacts"]["priority_variants_tsv"]),
+                Path(prs["dense_genotypes"]["artifacts"]["dense_vcf"]),
                 Path(prs["dense_genotypes"]["artifacts"]["pre_match_audit_tsv"]),
                 Path(prs["dense_genotypes"]["artifacts"]["pre_match_audit_json"]),
                 Path(prs["imputed_genotypes"]["artifacts"]["imputed_vcf"]),
+                Path(prs["dense_genotypes"]["artifacts"]["reference_db_archive"]),
                 Path(prs["artifacts"]["match_diagnostics_json"]),
                 Path(prs["artifacts"]["overlap_failures_tsv"]),
                 Path(prs["artifacts"]["match_summary"]),
                 Path(prs["artifacts"]["pgsc_report_html"]),
+                Path(prs["artifacts"]["scoring_input_pgen"]),
+                Path(prs["artifacts"]["scoring_input_psam"]),
+                Path(prs["artifacts"]["scoring_input_pvar"]),
+                Path(prs["artifacts"]["normalized_scoring_input_vcf"]),
             ]:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("test\n", encoding="utf-8")
             Path(monogenic["artifacts"]["annotated_vcf"] + ".tbi").write_text("index\n", encoding="utf-8")
+            Path(prs["dense_genotypes"]["artifacts"]["dense_vcf"] + ".tbi").write_text("index\n", encoding="utf-8")
 
             context_path = tmp / "context.json"
             monogenic_path = tmp / "monogenic.json"
@@ -213,22 +233,32 @@ class RenderReportTests(unittest.TestCase):
             self.assertIn("CRAM input: `C:\\Data\\sample.cram`", report_text)
             self.assertIn("Active CRAM path: `/home/user/.cache/genomics/staging/sample.cram`", report_text)
             self.assertIn("Reference probe: `ok`", report_text)
-            self.assertIn(f"Dense PRS VCF: `{tmp / 'cache' / 'dense.vcf.gz'}`", report_text)
+            self.assertIn("PRS scaffold stage: `ok`", report_text)
+            self.assertIn("Reference DB backbone: `pgsc_HGDP+1kGP_v1`", report_text)
+            self.assertIn(f"PRS scaffold VCF: `{tmp / 'cache' / 'dense.vcf.gz'}`", report_text)
+            self.assertIn(f"Reference DB archive: `{tmp / 'cache' / 'pgsc_HGDP+1kGP_v1.tar.zst'}`", report_text)
             self.assertIn("Accepted rows rescued by strand complement: `222`", report_text)
             self.assertIn(f"Pre-match audit TSV: `{tmp / 'cache' / 'pre_match_audit.tsv'}`", report_text)
             self.assertIn("Accepted score rows by source: `explicit_other_allele`=12000, `hm_inferOtherAllele`=345", report_text)
             self.assertIn("Import stage manifest: `/external/annotated.stage_manifest.json`", report_text)
-            self.assertIn("Dense genotype import note: external import without repo-generated stage manifest", report_text)
+            self.assertIn("Scaffold import note: external import without repo-generated stage manifest", report_text)
             self.assertIn(f"Imputed PRS VCF: `{tmp / 'cache' / 'imputed.vcf.gz'}`", report_text)
             self.assertIn("Imputation backend: `beagle`", report_text)
             self.assertIn("Imputation panel: `grch38_beagle_panel`", report_text)
             self.assertIn("Imputed genotype import note: external import without repo-generated stage manifest", report_text)
             self.assertIn(f"Match diagnostics JSON: `{tmp / 'cache' / 'match_diagnostics.json'}`", report_text)
+            self.assertIn("pgsc_calc input format: `pfile`", report_text)
+            self.assertIn(f"Scoring input PGEN: `{tmp / 'cache' / 'scoring_input.pgen'}`", report_text)
+            self.assertIn(f"Scoring input PSAM: `{tmp / 'cache' / 'scoring_input.psam'}`", report_text)
+            self.assertIn(f"Scoring input PVAR: `{tmp / 'cache' / 'scoring_input.pvar.zst'}`", report_text)
+            self.assertIn(f"Normalized scoring VCF: `{tmp / 'cache' / 'normalized_scoring.vcf.gz'}`", report_text)
+            self.assertIn("Scoring contigs normalized for pgsc_calc: `True`", report_text)
             self.assertTrue((results_dir / "monogenic" / "annotated.vcf.gz").exists())
             self.assertTrue((results_dir / "monogenic" / "annotated.vcf.gz.tbi").exists())
             self.assertTrue((results_dir / "prs" / "pre_match_audit.tsv").exists())
             self.assertTrue((results_dir / "prs" / "match_diagnostics.json").exists())
             self.assertTrue((results_dir / "prs" / "imputed_prs.vcf.gz").exists())
+            self.assertTrue((results_dir / "prs" / "prs_scaffold.vcf.gz").exists())
 
     def test_render_report_prs_only_omits_monogenic_section(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -269,7 +299,8 @@ class RenderReportTests(unittest.TestCase):
                 "dense_genotypes": {
                     "status": "ok",
                     "summary": {
-                        "union_sites": 100,
+                        "reference_db": "pgsc_HGDP+1kGP_v1",
+                        "scaffold_sites": 100,
                         "accepted_rows_by_source": {"explicit_other_allele": 90},
                         "skipped_reasons": {"missing_other_allele": 10},
                     },
@@ -284,11 +315,13 @@ class RenderReportTests(unittest.TestCase):
                         {"score": "PGS999002_hmPOS_GRCh38", "match_percent": "53.29"},
                     ],
                     "log_path": "/cache/pgsc_calc.log",
+                    "renamed_chr_prefix": True,
                 },
                 "artifacts": {
                     "match_diagnostics_json": "/cache/match_diagnostics.json",
                     "overlap_failures_tsv": "/cache/overlap_failures.tsv",
                     "match_summary": "/cache/match_summary.csv",
+                    "normalized_scoring_input_vcf": "/cache/normalized_scoring.vcf.gz",
                 },
             }
 
@@ -324,6 +357,7 @@ class RenderReportTests(unittest.TestCase):
             self.assertIn("Execution mode: `prs-only`", report_text)
             self.assertNotIn("## Monogenic", report_text)
             self.assertIn("## PRS", report_text)
+            self.assertIn("Scoring contigs normalized for pgsc_calc: `True`", report_text)
             self.assertIn("Match threshold summary TSV: `/cache/overlap_failures.tsv`", report_text)
             self.assertIn("| PGS999001_hmPOS_GRCh38 | 67.56 |", report_text)
 

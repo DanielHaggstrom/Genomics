@@ -36,7 +36,7 @@ MONOGENIC_DEFAULTS = {
 PRS_DEFAULTS = {
     "enabled": True,
     "run_ancestry": False,
-    "reference_db": None,
+    "reference_db": "pgsc_HGDP+1kGP_v1",
     "min_overlap": 0.75,
     "sample_sex": None,
     "workers": None,
@@ -93,6 +93,8 @@ def apply_defaults(manifest: dict[str, Any]) -> dict[str, Any]:
 
     prs = dict(PRS_DEFAULTS)
     prs.update(analysis.get("prs", {}) or {})
+    if not prs.get("reference_db"):
+        prs["reference_db"] = PRS_DEFAULTS["reference_db"]
     prs_imputation = dict(PRS_DEFAULTS["imputation"])
     prs_imputation.update((analysis.get("prs", {}) or {}).get("imputation", {}) or {})
     prs["imputation"] = prs_imputation

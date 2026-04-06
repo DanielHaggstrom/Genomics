@@ -1,17 +1,24 @@
 from __future__ import annotations
 
 import gzip
+import subprocess
 import unittest
 from pathlib import Path
 import tempfile
 
 from workflow.stages.prs import (
     base_contig_name,
+    beagle_failed_due_to_no_common_markers,
+    beagle_log_has_no_common_markers,
+    build_pgsc_calc_resource_config,
+    build_pgsc_calc_samplesheet,
     canonical_score_id,
     complement_base_tokens,
     inject_missing_contig_headers,
+    iter_reference_db_sites,
     target_has_imputable_markers,
     load_imputation_panel,
+    parse_pvar_header,
     parse_base_tokens,
     parse_overlap_diagnostics,
     plink_sex_code,
@@ -20,6 +27,7 @@ from workflow.stages.prs import (
     resolve_score_row_alleles,
     resolve_score_row_alleles_for_site,
     safe_sampleset_name,
+    strip_vcf_suffix,
 )
 
 
@@ -52,6 +60,10 @@ class PrsHelperTests(unittest.TestCase):
         self.assertEqual(safe_sampleset_name("bad_name with spaces"), "bad-name-with-spaces")
         self.assertEqual(safe_sampleset_name("reference"), "sample")
 
+    def test_strip_vcf_suffix_handles_bgz_and_vcf(self) -> None:
+        self.assertEqual(strip_vcf_suffix(Path("/tmp/input.vcf.gz")), Path("/tmp/input"))
+        self.assertEqual(strip_vcf_suffix(Path("/tmp/input.vcf")), Path("/tmp/input"))
+
     def test_parse_overlap_diagnostics(self) -> None:
         log = """
         Score PGS999001_hmPOS_GRCh38 fails minimum matching threshold (37.95% variants match)
@@ -67,6 +79,63 @@ class PrsHelperTests(unittest.TestCase):
         self.assertEqual(plink_sex_code("male"), "M")
         self.assertEqual(plink_sex_code("female"), "F")
         self.assertIsNone(plink_sex_code(None))
+
+    def test_build_pgsc_calc_samplesheet_for_vcf_with_dosage(self) -> None:
+        text = build_pgsc_calc_samplesheet(
+            sampleset="TEST",
+            scoring_input_info={"path_prefix": "/cache/input", "format": "vcf"},
+            dosage_field="DS",
+        )
+        self.assertEqual(
+            text,
+            "sampleset,path_prefix,chrom,format,vcf_genotype_field\n"
+            "TEST,/cache/input,,vcf,DS\n",
+        )
+
+    def test_build_pgsc_calc_samplesheet_for_pfile_omits_dosage_field(self) -> None:
+        text = build_pgsc_calc_samplesheet(
+            sampleset="TEST",
+            scoring_input_info={"path_prefix": "/cache/input", "format": "pfile"},
+            dosage_field="DS",
+        )
+        self.assertEqual(
+            text,
+            "sampleset,path_prefix,chrom,format\n"
+            "TEST,/cache/input,,pfile\n",
+        )
+
+    def test_build_pgsc_calc_resource_config_targets_match_and_score_processes(self) -> None:
+        text = build_pgsc_calc_resource_config(max_memory="14.GB", match_cpus=1, score_cpus=1)
+        self.assertIn("MATCH:MATCH_VARIANTS", text)
+        self.assertIn("APPLY_SCORE:PLINK2_SCORE", text)
+        self.assertIn("APPLY_SCORE:SCORE_AGGREGATE", text)
+        self.assertIn("cpus = 1", text)
+        self.assertIn("memory = '14.GB'", text)
+
+    def test_beagle_failed_due_to_no_common_markers_detects_known_error(self) -> None:
+        error = subprocess.CalledProcessError(
+            1,
+            ["java", "-jar", "beagle.jar"],
+            stderr="java.lang.IllegalArgumentException: The reference and target VCF files contain no markers in common in the window:\nX:2781457-35596385\n",
+        )
+        self.assertTrue(beagle_failed_due_to_no_common_markers(error))
+
+    def test_beagle_failed_due_to_no_common_markers_ignores_other_errors(self) -> None:
+        error = subprocess.CalledProcessError(
+            1,
+            ["java", "-jar", "beagle.jar"],
+            stderr="java.lang.OutOfMemoryError: Java heap space\n",
+        )
+        self.assertFalse(beagle_failed_due_to_no_common_markers(error))
+
+    def test_beagle_log_has_no_common_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log = Path(tmpdir) / "chrX.beagle.log"
+            log.write_text(
+                "java.lang.IllegalArgumentException: The reference and target VCF files contain no markers in common in the window:\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(beagle_log_has_no_common_markers(log))
 
     def test_parse_base_tokens_accepts_single_base_tokens_only(self) -> None:
         self.assertEqual(parse_base_tokens("G/T"), {"G", "T"})
@@ -90,6 +159,27 @@ class PrsHelperTests(unittest.TestCase):
         original = "##fileformat=VCFv4.2\n##contig=<ID=5>\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n"
         updated = inject_missing_contig_headers(original, ["5"])
         self.assertEqual(updated, original)
+
+    def test_parse_pvar_header_and_iter_reference_db_sites(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pvar = Path(tmpdir) / "chr1.pvar"
+            pvar.write_text(
+                "\n".join(
+                    [
+                        "##INFO=test",
+                        "#CHROM\tPOS\tID\tREF\tALT",
+                        "1\t101\trs1\tA\tG",
+                        "1\t102\trs2\tC\tT,G",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(parse_pvar_header("#CHROM\tPOS\tID\tREF\tALT\n")["POS"], 1)
+            records = list(iter_reference_db_sites(pvar, target_prefix="chr"))
+            self.assertEqual(records[0]["chrom"], "chr1")
+            self.assertEqual(records[0]["alts"], ["G"])
+            self.assertEqual(records[1]["alts"], ["T", "G"])
 
     def test_target_has_imputable_markers_ignores_reference_only_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
