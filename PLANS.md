@@ -43,13 +43,13 @@ Path of highest sanity:
 - keep external `reuse.imputed_prs_vcf` support, but only as an explicit stage-boundary import
 
 Concrete next steps:
-- use `analysis.prs.reference_db` as the scaffold backbone source rather than a nullable side option
-- build per-chromosome scaffold site sets from the official reference database instead of starting from only requested score loci
-- derive scaffold genotypes from CRAM/gVCF materialization that preserves explicit non-variant calls at scaffold sites
-- keep score-specific harmonized loci that are absent from the backbone as direct-call extras, but stop letting them define the whole scaffold
-- score directly from VCF input to `pgsc_calc` instead of making PLINK conversion the canonical precondition
-- treat local Beagle imputation as a scaffold-imputation layer, not a PRS-target-locus imputation step
-- compare direct-scaffold vs imputed-scaffold overlap score by score with `min_overlap` fixed at `0.75`
+- done: `analysis.prs.reference_db` now defaults to `pgsc_HGDP+1kGP_v1`
+- done: PRS scaffold site generation now starts from the official reference database and layers score-extra harmonized loci on top
+- done: PRS scaffold shards are now materialized from whole-contig gVCFs, then subset back to scaffold sites with explicit non-variant calls preserved
+- done: `pgsc_calc` scoring now uses the repo-built compatibility surface directly instead of the repo forcing the older dense-target path
+- done: local Beagle imputation now acts as a scaffold-imputation layer, including passthrough handling for panel-unavailable or no-overlap shards
+- done: direct-scaffold and scaffold+imputed paths have both been exercised on the real sample with `min_overlap` fixed at `0.75`
+- next: if PRS work resumes, shift effort from pipeline plumbing to score-level portability diagnostics and target-representation experiments
 
 Decision rules:
 - if direct scaffold scoring clears one or more intended scores above `0.75`, keep direct scaffold as a supported PRS path
@@ -208,5 +208,8 @@ Guardrails for this cleanup phase:
 - Done: execution mode is explicit and derived as `monogenic-only`, `prs-only`, or `both`.
 - Done: resource-aware worker planning is implemented for monogenic and PRS shard work.
 - Done: cache-side shard progress now records reused vs rebuilt shard completions.
-- In progress: the repo still treats the older PRS-targeted dense path as the implementation backbone; that is the next thing to retire.
-- Next likely improvement: replace PRS-target-locus genotype generation with broad scaffold generation from the official reference database, then validate direct-scaffold and scaffold+imputation overlap on the real sample.
+- Done: the scaffold-first PRS path is now the implementation backbone, and the older PRS-targeted dense flow is no longer the canonical runtime path.
+- Done: the full scaffold-first + imputed PRS path completes end to end on the real sample.
+- Done: the remaining PRS blocker is no longer Docker, Beagle, contigs, chrX handling, metadata propagation, or scoring-surface plumbing.
+- Current measured result: all requested scores still fail `min_overlap: 0.75` even after scaffold-first imputation, with best overlaps around `PGS002255=67.62%` and `PGS000838=62.95%`.
+- Next likely improvement: if PRS work continues, focus on score portability analysis, alternate/commoner cohort-style target representations, or narrower score selection rather than more pipeline format fixes.
