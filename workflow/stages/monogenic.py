@@ -5,16 +5,22 @@ import argparse
 import csv
 import gzip
 import pathlib
-import urllib.request
 from collections import defaultdict
 from typing import Any, Iterator
 
 from workflow.core.runtime import (
     build_docker_run_command,
     complete_artifact,
+    completed_vcf,
+    record_vcf_checkpoint,
+    download_url_to_path,
     complete_artifacts_exist,
+    checkpoint_complete,
+    record_checkpoint,
     ensure_dir,
     ensure_docker_ready,
+    germline_gvcf_dir,
+    hash_strings,
     init_shard_progress,
     load_json,
     plan_worker_pool,
@@ -27,7 +33,7 @@ from workflow.core.runtime import (
 )
 
 
-STAGE_VERSION = 3
+STAGE_VERSION = 4
 GATK_IMAGE = "broadinstitute/gatk:4.6.1.0"
 VEP_IMAGE = "ensemblorg/ensembl-vep:release_115.0"
 CLINVAR_URL = "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz"
@@ -173,6 +179,23 @@ def load_existing_stage(stage_manifest_path: pathlib.Path, cache_key: str, requi
         return None
     payload["reused"] = True
     return payload
+
+
+def monogenic_cache_key(context: dict[str, Any]) -> str:
+    cfg = context["manifest"]["analysis"]["monogenic"]
+    reference = context["reference_bundle"]
+    return hash_strings([
+        f"monogenic-v{STAGE_VERSION}",
+        pathlib.Path(__file__).read_text(encoding="utf-8"),
+        context["input_fingerprint"]["id"], context["sample_id"],
+        reference.get("fingerprint_id") or reference.get("bundle_id", "no-reference"),
+        GATK_IMAGE, VEP_IMAGE,
+        str(cfg["mode"]), str(cfg["max_af"]), str(cfg["vep_forks"]),
+        *[
+            str((context["reuse"].get(name) or {}).get("fingerprint", {}).get("id", "none"))
+            for name in ("called_vcf", "annotated_vcf")
+        ],
+    ])
 
 
 def write_tsv(path: pathlib.Path, rows: list[dict[str, str]], header: list[str]) -> None:
@@ -477,14 +500,18 @@ def build_gatk_command(
     output_dir: pathlib.Path,
     image: str,
     inner_args: list[str],
+    gvcf_dir: pathlib.Path | None = None,
 ) -> list[str]:
+    mounts = [
+        (cram_path.parent, "/input", "ro"),
+        (reference_fasta.parent, "/ref", "ro"),
+        (output_dir, "/out", "rw"),
+    ]
+    if gvcf_dir is not None:
+        mounts.append((gvcf_dir, "/gvcf", "rw"))
     return build_docker_run_command(
         image=image,
-        mounts={
-            cram_path.parent: "/input",
-            reference_fasta.parent: "/ref",
-            output_dir: "/out",
-        },
+        mounts=mounts,
         inner_args=inner_args,
         docker_bin=docker_bin,
     )
@@ -500,16 +527,24 @@ def call_monogenic_shard(
     sample_id: str,
     pairhmm_threads: int,
     java_memory: str,
+    gvcf_root: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     shard_dir = ensure_dir(stage_root / "shards" / shard["name"])
     log_dir = ensure_dir(stage_root / "logs")
-    gvcf = shard_dir / f"{sample_id}.{shard['name']}.g.vcf.gz"
+    gvcf_dir = germline_gvcf_dir(
+        gvcf_root or stage_root / "germline_gvcf", cram_path=cram_path,
+        reference_fasta=reference_fasta, image=GATK_IMAGE, intervals=shard["intervals"],
+    )
+    gvcf = gvcf_dir / "germline.g.vcf.gz"
     raw_vcf = shard_dir / f"{sample_id}.{shard['name']}.raw.vcf.gz"
     interval_args = [item for interval in shard["intervals"] for item in ("-L", interval)]
-    gvcf_reused = complete_artifact(gvcf)
-    raw_vcf_reused = complete_artifact(raw_vcf)
+    receipt = gvcf_dir / "completed.json"
+    gvcf_reused = checkpoint_complete(receipt, [gvcf, pathlib.Path(str(gvcf) + ".tbi")])
+    raw_receipt = shard_dir / "raw.completed.json"
+    raw_artifacts = [raw_vcf, pathlib.Path(str(raw_vcf) + ".tbi")]
+    raw_vcf_reused = checkpoint_complete(raw_receipt, raw_artifacts)
 
-    if not gvcf_reused:
+    if not raw_vcf_reused and not gvcf_reused:
         remove_if_exists(gvcf, f"{gvcf}.tbi")
         run_command(
             build_gatk_command(
@@ -518,6 +553,7 @@ def call_monogenic_shard(
                 reference_fasta=reference_fasta,
                 output_dir=stage_root,
                 image=GATK_IMAGE,
+                gvcf_dir=gvcf_dir,
                 inner_args=[
                     "gatk",
                     "--java-options",
@@ -525,7 +561,7 @@ def call_monogenic_shard(
                     "HaplotypeCaller",
                     "-R", f"/ref/{reference_fasta.name}",
                     "-I", f"/input/{cram_path.name}",
-                    "-O", f"/out/shards/{shard['name']}/{gvcf.name}",
+                    "-O", f"/gvcf/{gvcf.name}",
                     "-ERC", "GVCF",
                     "--native-pair-hmm-threads", str(pairhmm_threads),
                     *interval_args,
@@ -534,6 +570,7 @@ def call_monogenic_shard(
             check=True,
             log_path=log_dir / f"{shard['name']}.haplotypecaller.log",
         )
+        record_checkpoint(receipt, [gvcf, pathlib.Path(str(gvcf) + ".tbi")])
 
     if not raw_vcf_reused:
         remove_if_exists(raw_vcf, f"{raw_vcf}.tbi")
@@ -544,13 +581,14 @@ def call_monogenic_shard(
                 reference_fasta=reference_fasta,
                 output_dir=stage_root,
                 image=GATK_IMAGE,
+                gvcf_dir=gvcf_dir,
                 inner_args=[
                     "gatk",
                     "--java-options",
                     f"-Xmx{java_memory}",
                     "GenotypeGVCFs",
                     "-R", f"/ref/{reference_fasta.name}",
-                    "-V", f"/out/shards/{shard['name']}/{gvcf.name}",
+                    "-V", f"/gvcf/{gvcf.name}",
                     "-O", f"/out/shards/{shard['name']}/{raw_vcf.name}",
                     *interval_args,
                 ],
@@ -558,6 +596,7 @@ def call_monogenic_shard(
             check=True,
             log_path=log_dir / f"{shard['name']}.genotypegvcfs.log",
         )
+        record_checkpoint(raw_receipt, raw_artifacts)
 
     return {
         "shard_name": shard["name"],
@@ -577,7 +616,7 @@ def concat_and_filter_monogenic(stage_root: pathlib.Path, reference_fasta: pathl
     java_memory = "4g"
     log_dir = ensure_dir(stage_root / "logs")
 
-    if not complete_artifact(raw_vcf):
+    if not completed_vcf(raw_vcf):
         remove_if_exists(raw_vcf, f"{raw_vcf}.tbi")
         run_command(
             ["bcftools", "concat", "-a", "-Oz", "-o", str(raw_vcf), *shard_vcfs],
@@ -589,13 +628,14 @@ def concat_and_filter_monogenic(stage_root: pathlib.Path, reference_fasta: pathl
             check=True,
             log_path=log_dir / "raw.concat.index.log",
         )
+        record_vcf_checkpoint(raw_vcf)
 
-    if not complete_artifact(tmp_snp):
+    if not completed_vcf(tmp_snp):
         remove_if_exists(stage_root / f"{sample_id}.snps.vcf.gz", stage_root / f"{sample_id}.snps.vcf.gz.tbi", tmp_snp, f"{tmp_snp}.tbi")
         run_command(
             build_docker_run_command(
                 image=GATK_IMAGE,
-                mounts={reference_fasta.parent: "/ref", stage_root: "/out"},
+                mounts=[(reference_fasta.parent, "/ref", "ro"), (stage_root, "/out", "rw")],
                 inner_args=[
                     "gatk",
                     "--java-options",
@@ -614,7 +654,7 @@ def concat_and_filter_monogenic(stage_root: pathlib.Path, reference_fasta: pathl
         run_command(
             build_docker_run_command(
                 image=GATK_IMAGE,
-                mounts={reference_fasta.parent: "/ref", stage_root: "/out"},
+                mounts=[(reference_fasta.parent, "/ref", "ro"), (stage_root, "/out", "rw")],
                 inner_args=[
                     "gatk",
                     "--java-options",
@@ -631,13 +671,14 @@ def concat_and_filter_monogenic(stage_root: pathlib.Path, reference_fasta: pathl
             check=True,
             log_path=log_dir / "filter_snps.log",
         )
+        record_vcf_checkpoint(tmp_snp)
 
-    if not complete_artifact(tmp_indel):
+    if not completed_vcf(tmp_indel):
         remove_if_exists(stage_root / f"{sample_id}.indels.vcf.gz", stage_root / f"{sample_id}.indels.vcf.gz.tbi", tmp_indel, f"{tmp_indel}.tbi")
         run_command(
             build_docker_run_command(
                 image=GATK_IMAGE,
-                mounts={reference_fasta.parent: "/ref", stage_root: "/out"},
+                mounts=[(reference_fasta.parent, "/ref", "ro"), (stage_root, "/out", "rw")],
                 inner_args=[
                     "gatk",
                     "--java-options",
@@ -656,7 +697,7 @@ def concat_and_filter_monogenic(stage_root: pathlib.Path, reference_fasta: pathl
         run_command(
             build_docker_run_command(
                 image=GATK_IMAGE,
-                mounts={reference_fasta.parent: "/ref", stage_root: "/out"},
+                mounts=[(reference_fasta.parent, "/ref", "ro"), (stage_root, "/out", "rw")],
                 inner_args=[
                     "gatk",
                     "--java-options",
@@ -673,8 +714,9 @@ def concat_and_filter_monogenic(stage_root: pathlib.Path, reference_fasta: pathl
             check=True,
             log_path=log_dir / "filter_indels.log",
         )
+        record_vcf_checkpoint(tmp_indel)
 
-    if not complete_artifact(filtered_vcf):
+    if not completed_vcf(filtered_vcf):
         remove_if_exists(filtered_vcf, f"{filtered_vcf}.tbi")
         run_command(
             ["bcftools", "concat", "-a", "-Oz", "-o", str(filtered_vcf), str(tmp_snp), str(tmp_indel)],
@@ -686,6 +728,7 @@ def concat_and_filter_monogenic(stage_root: pathlib.Path, reference_fasta: pathl
             check=True,
             log_path=log_dir / "filtered.concat.index.log",
         )
+        record_vcf_checkpoint(filtered_vcf)
 
     return str(raw_vcf), str(filtered_vcf)
 
@@ -696,10 +739,11 @@ def ensure_vep_resources(tool_cache_root: pathlib.Path) -> pathlib.Path:
     cache_info = cache_root / "homo_sapiens" / "115_GRCh38" / "info.txt"
     if not cache_info.exists():
         tarball = ensure_dir(cache_root / "tmp") / "homo_sapiens_vep_115_GRCh38.tar.gz"
-        urllib.request.urlretrieve(
-            "https://ftp.ensembl.org/pub/release-115/variation/indexed_vep_cache/homo_sapiens_vep_115_GRCh38.tar.gz",
-            tarball,
-        )
+        if not tarball.exists():
+            download_url_to_path(
+                "https://ftp.ensembl.org/pub/release-115/variation/indexed_vep_cache/homo_sapiens_vep_115_GRCh38.tar.gz",
+                tarball,
+            )
         run_command(["tar", "-xzf", str(tarball), "-C", str(cache_root)], check=True)
         if not cache_info.exists():
             raise RuntimeError(f"VEP cache extraction did not produce {cache_info}")
@@ -709,9 +753,9 @@ def ensure_vep_resources(tool_cache_root: pathlib.Path) -> pathlib.Path:
     clinvar_vcf = custom_root / "clinvar.vcf.gz"
     clinvar_tbi = custom_root / "clinvar.vcf.gz.tbi"
     if not clinvar_vcf.exists():
-        urllib.request.urlretrieve(CLINVAR_URL, clinvar_vcf)
+        download_url_to_path(CLINVAR_URL, clinvar_vcf)
     if not clinvar_tbi.exists():
-        urllib.request.urlretrieve(CLINVAR_TBI_URL, clinvar_tbi)
+        download_url_to_path(CLINVAR_TBI_URL, clinvar_tbi)
     return vep_root
 
 
@@ -724,8 +768,10 @@ def annotate_with_vep(
     forks: int,
 ) -> str:
     if not complete_artifact(input_vcf):
-        run_command(["tabix", "-f", "-p", "vcf", str(input_vcf)], check=True)
-    if complete_artifact(output_vcf):
+        raise ValueError(f"Annotation input must be a nonempty VCF with its index: {input_vcf}")
+    if input_vcf.resolve() == output_vcf.resolve() or (output_vcf.exists() and input_vcf.samefile(output_vcf)):
+        raise ValueError(f"Refusing to annotate over the input VCF: {input_vcf}")
+    if completed_vcf(output_vcf):
         return str(output_vcf)
 
     output_vcf.parent.mkdir(parents=True, exist_ok=True)
@@ -736,8 +782,10 @@ def annotate_with_vep(
         build_docker_run_command(
             image=VEP_IMAGE,
             mounts={
-                work_root: "/work",
-                vep_data_root: "/vep_data",
+                input_vcf: (f"/input/{input_vcf.name}", "ro"),
+                pathlib.Path(str(input_vcf) + ".tbi"): (f"/input/{input_vcf.name}.tbi", "ro"),
+                work_root: ("/work", "rw"),
+                vep_data_root: ("/vep_data", "ro"),
             },
             inner_args=[
                 "vep",
@@ -746,7 +794,7 @@ def annotate_with_vep(
                 "--assembly", "GRCh38",
                 "--species", "homo_sapiens",
                 "--dir_cache", "/vep_data/cache",
-                "--input_file", f"/work/{input_vcf.name}",
+                "--input_file", f"/input/{input_vcf.name}",
                 "--output_file", f"/work/{output_vcf.name}",
                 "--warning_file", f"/work/{warning_path.name}",
                 "--format", "vcf",
@@ -767,6 +815,7 @@ def annotate_with_vep(
         log_path=log_path,
     )
     run_command(["tabix", "-f", "-p", "vcf", str(output_vcf)], check=True, log_path=output_vcf.parent / "vep.index.log")
+    record_vcf_checkpoint(output_vcf)
     return str(output_vcf)
 
 
@@ -782,28 +831,23 @@ def build_import_summary(reuse_entry: dict[str, Any] | None) -> dict[str, Any] |
     }
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--context", required=True)
     parser.add_argument("--output", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     context = load_json(args.context)
     cfg = context["manifest"]["analysis"]["monogenic"]
-    stage_root = ensure_dir(pathlib.Path(context["cache"]["monogenic_root"]))
+    cache_key = monogenic_cache_key(context)
+    cache_root = pathlib.Path(context["cache"]["monogenic_root"])
+    stage_root = ensure_dir(cache_root / cache_key)
     stage_manifest_path = stage_root / "stage_manifest.json"
-    cache_key = ":".join(
-        [
-            f"v{STAGE_VERSION}",
-            context["input_fingerprint"]["id"],
-            context["reference_bundle"].get("bundle_id", "no-reference"),
-            cfg["mode"],
-            str(cfg["max_af"]),
-            str(cfg["vep_forks"]),
-            str(bool(context["reuse"].get("called_vcf"))),
-            str(bool(context["reuse"].get("annotated_vcf"))),
-        ]
-    )
+    live_status_path = cache_root / "stage_manifest.json"
+
+    def save_stage(payload: dict[str, Any]) -> None:
+        write_json(stage_manifest_path, payload)
+        write_json(live_status_path, payload)
 
     try:
         worker_plan: dict[str, Any] | None = None
@@ -823,7 +867,7 @@ def main() -> None:
                 message=message,
                 artifacts=artifacts or {"log_dir": str(stage_root / "logs")},
             )
-            write_json(stage_manifest_path, {key: value for key, value in payload.items() if value is not None})
+            save_stage({key: value for key, value in payload.items() if value is not None})
 
         if not cfg["enabled"]:
             payload = stage_payload("monogenic", "skipped", message="Monogenic stage disabled.")
@@ -842,6 +886,7 @@ def main() -> None:
             ],
         )
         if reused:
+            write_json(live_status_path, reused)
             write_json(args.output, reused)
             return
 
@@ -874,7 +919,7 @@ def main() -> None:
                         input_fingerprint_id=context["input_fingerprint"]["id"],
                         message="CRAM-based monogenic calling requires a validated local reference bundle.",
                     )
-                    write_json(stage_manifest_path, payload)
+                    save_stage(payload)
                     write_json(args.output, payload)
                     return
 
@@ -909,6 +954,7 @@ def main() -> None:
                             sample_id=sample_id,
                             pairhmm_threads=worker_plan["pairhmm_threads"],
                             java_memory=worker_plan["java_memory"],
+                            gvcf_root=cache_root.parent / "germline_gvcf",
                         )
                     )
                     for shard in shards
@@ -985,7 +1031,7 @@ def main() -> None:
                 "review_unique_tsv": str(review_unique),
             },
         )
-        write_json(stage_manifest_path, payload)
+        save_stage(payload)
         write_json(args.output, payload)
     except Exception as exc:
         payload = stage_payload(
@@ -998,7 +1044,7 @@ def main() -> None:
             progress=progress,
             artifacts={"log_dir": str(stage_root / "logs")},
         )
-        write_json(stage_manifest_path, payload)
+        save_stage(payload)
         write_json(args.output, payload)
 
 

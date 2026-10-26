@@ -2,364 +2,129 @@ from __future__ import annotations
 
 import gzip
 import json
-import os
+from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
-from pathlib import Path
+from unittest.mock import patch
+
+from workflow.core.runtime import atomic_copy
+from workflow.reporting.report import enforce_outcome, render_report
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class RenderReportTests(unittest.TestCase):
-    def test_render_report_writes_markdown(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            results_dir = tmp / "results" / "TEST" / "latest"
-            report_dir = results_dir / "report"
-            manifests_dir = results_dir / "manifests"
-            report_dir.mkdir(parents=True, exist_ok=True)
-            manifests_dir.mkdir(parents=True, exist_ok=True)
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.cache = self.root / "cache"
+        self.cache.mkdir()
+        self.results = self.root / "results"
+        self.context = {
+            "sample_id": "TEST", "execution_mode": "prs-only",
+            "manifest": {"analysis": {"monogenic": {"enabled": False}, "prs": {"enabled": True}}},
+            "reference_bundle": {"status": "ready", "fasta": "/private/reference.fa"},
+            "results": {"run_dir": str(self.results), "report_dir": str(self.results / "report")},
+        }
 
-            scores_path = tmp / "aggregated_scores.txt.gz"
-            with gzip.open(scores_path, "wt", encoding="utf-8") as handle:
-                handle.write("sampleset\tIID\tPGS\tSUM\n")
-                handle.write("test\tTEST\tPGS999001_hmPOS_GRCh38\t1.234\n")
+    def fixture(self, name: str, content: str = "fixture\n") -> str:
+        path = self.cache / name
+        path.write_text(content)
+        return str(path)
 
-            context = {
-                "sample_id": "TEST",
-                "execution_mode": "both",
-                "input_fingerprint": {"id": "fingerprint"},
-                "inputs": {
-                    "original": {
-                        "cram": "C:\\Data\\sample.cram",
-                        "crai": "C:\\Data\\sample.cram.crai",
-                    },
-                    "active": {
-                        "cram": "/home/user/.cache/genomics/staging/sample.cram",
-                        "crai": "/home/user/.cache/genomics/staging/sample.cram.crai",
-                    },
-                    "staged": {"cram": True, "crai": True},
-                },
-                "runtime": {
-                    "linux_cache_root": "/home/user/.cache/genomics",
-                },
-                "results": {
-                    "run_dir": str(results_dir),
-                    "report_dir": str(report_dir),
-                    "manifests_dir": str(manifests_dir),
-                },
-                "manifest": {
-                    "analysis": {
-                        "monogenic": {"enabled": True},
-                        "prs": {"enabled": True},
-                    },
-                },
-                "reference_probe": {
-                    "status": "ok",
-                    "summary": {
-                        "contig_count": 25,
-                        "first_contigs": ["chr1", "chr2"],
-                        "contig_prefix": "chr",
-                        "all_contigs_have_md5": True,
-                    },
-                    "provenance_hints": {
-                        "aligner": "DRAGEN",
-                        "ref_dir": "/refs/dragen/11",
-                    },
-                    "remote_decode_probe": {"status": "ok"},
-                },
-                "reference_bundle": {
-                    "status": "ready",
-                    "fasta": "/home/user/.cache/genomics/reference/hg38.fa",
-                    "comparison": {"exact_dictionary_match": True, "extra_contigs": []},
-                },
-                "upstream_sample_name": "TEST",
-            }
-            monogenic = {
-                "status": "ok",
-                "source_mode": "called_from_cram",
-                "summary": {"priority_rows_after_dedup": "10", "total_variant_records_seen": "20"},
-                "artifacts": {
-                    "annotated_vcf": str(tmp / "cache" / "annotated.vcf.gz"),
-                    "clinvar_unique_tsv": str(tmp / "cache" / "clinvar.tsv"),
-                    "lof_unique_tsv": str(tmp / "cache" / "lof.tsv"),
-                    "review_unique_tsv": str(tmp / "cache" / "review.tsv"),
-                    "priority_summary": str(tmp / "cache" / "priority_variants.summary.txt"),
-                    "priority_variants_tsv": str(tmp / "cache" / "priority_variants.tsv"),
-                },
-                "import_details": {
-                    "provenance": "repo_stage_manifest",
-                    "source": "/external/annotated.vcf.gz",
-                    "active": str(tmp / "cache" / "annotated.vcf.gz"),
-                    "trusted_provenance": True,
-                    "stage_manifest": "/external/annotated.stage_manifest.json",
-                },
-            }
-            prs = {
-                "status": "ok",
-                "dense_genotypes": {
-                    "status": "ok",
-                    "summary": {
-                        "reference_db": "pgsc_HGDP+1kGP_v1",
-                        "scaffold_sites": 12345,
-                        "backbone_sites": 12000,
-                        "score_extra_sites": 345,
-                        "accepted_strand_flip_rows": 222,
-                        "accepted_rows_by_source": {
-                            "explicit_other_allele": 12000,
-                            "hm_inferOtherAllele": 345,
-                        },
-                        "skipped_reasons": {
-                            "missing_other_allele": 12,
-                            "reference_not_in_score_alleles": 34,
-                        },
-                    },
-                    "artifacts": {
-                        "dense_vcf": str(tmp / "cache" / "dense.vcf.gz"),
-                        "targets_vcf": str(tmp / "cache" / "targets.vcf.gz"),
-                        "reference_db_archive": str(tmp / "cache" / "pgsc_HGDP+1kGP_v1.tar.zst"),
-                        "pre_match_audit_tsv": str(tmp / "cache" / "pre_match_audit.tsv"),
-                        "pre_match_audit_json": str(tmp / "cache" / "pre_match_audit.json"),
-                    },
-                    "import_details": {
-                        "provenance": "external_import",
-                        "source": "/external/dense.vcf.gz",
-                        "active": str(tmp / "cache" / "dense.vcf.gz"),
-                        "trusted_provenance": False,
-                    },
-                },
-                "imputed_genotypes": {
-                    "status": "ok",
-                    "source_mode": "import_imputed_prs_vcf",
-                    "summary": {
-                        "backend": "beagle",
-                        "panel_id": "grch38_beagle_panel",
-                        "info_threshold": 0.8,
-                    },
-                    "import_details": {
-                        "provenance": "external_import",
-                        "source": "/external/imputed.vcf.gz",
-                        "active": str(tmp / "cache" / "imputed.vcf.gz"),
-                        "trusted_provenance": False,
-                    },
-                    "artifacts": {
-                        "imputed_vcf": str(tmp / "cache" / "imputed.vcf.gz"),
-                    },
-                },
-                "artifacts": {
-                    "aggregated_scores": str(scores_path),
-                    "match_diagnostics_json": str(tmp / "cache" / "match_diagnostics.json"),
-                    "overlap_failures_tsv": str(tmp / "cache" / "overlap_failures.tsv"),
-                    "match_summary": str(tmp / "cache" / "match_summary.csv"),
-                    "pgsc_report_html": str(tmp / "cache" / "pgsc_report.html"),
-                    "scoring_input_pgen": str(tmp / "cache" / "scoring_input.pgen"),
-                    "scoring_input_psam": str(tmp / "cache" / "scoring_input.psam"),
-                    "scoring_input_pvar": str(tmp / "cache" / "scoring_input.pvar.zst"),
-                    "normalized_scoring_input_vcf": str(tmp / "cache" / "normalized_scoring.vcf.gz"),
-                },
-                "summary": {
-                    "scoring_input_kind": "imputed_vcf",
-                    "pgsc_input_format": "pfile",
-                    "renamed_chr_prefix": True,
-                },
-            }
+    def render(self, prs: dict, monogenic: dict | None = None) -> tuple[str, dict]:
+        summary_path = self.root / "summary.json"
+        render_report(self.context, monogenic or {"status": "skipped"}, prs, output_summary=summary_path)
+        return (self.results / "report" / "report.md").read_text(), json.loads(summary_path.read_text())
 
-            cache_dir = tmp / "cache"
-            cache_dir.mkdir(exist_ok=True)
-            for path in [
-                Path(monogenic["artifacts"]["annotated_vcf"]),
-                Path(monogenic["artifacts"]["clinvar_unique_tsv"]),
-                Path(monogenic["artifacts"]["lof_unique_tsv"]),
-                Path(monogenic["artifacts"]["review_unique_tsv"]),
-                Path(monogenic["artifacts"]["priority_summary"]),
-                Path(monogenic["artifacts"]["priority_variants_tsv"]),
-                Path(prs["dense_genotypes"]["artifacts"]["dense_vcf"]),
-                Path(prs["dense_genotypes"]["artifacts"]["pre_match_audit_tsv"]),
-                Path(prs["dense_genotypes"]["artifacts"]["pre_match_audit_json"]),
-                Path(prs["imputed_genotypes"]["artifacts"]["imputed_vcf"]),
-                Path(prs["dense_genotypes"]["artifacts"]["reference_db_archive"]),
-                Path(prs["artifacts"]["match_diagnostics_json"]),
-                Path(prs["artifacts"]["overlap_failures_tsv"]),
-                Path(prs["artifacts"]["match_summary"]),
-                Path(prs["artifacts"]["pgsc_report_html"]),
-                Path(prs["artifacts"]["scoring_input_pgen"]),
-                Path(prs["artifacts"]["scoring_input_psam"]),
-                Path(prs["artifacts"]["scoring_input_pvar"]),
-                Path(prs["artifacts"]["normalized_scoring_input_vcf"]),
-            ]:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("test\n", encoding="utf-8")
-            Path(monogenic["artifacts"]["annotated_vcf"] + ".tbi").write_text("index\n", encoding="utf-8")
-            Path(prs["dense_genotypes"]["artifacts"]["dense_vcf"] + ".tbi").write_text("index\n", encoding="utf-8")
+    def test_complete_score_results_without_heavy_genotype_duplicates(self) -> None:
+        self.context["execution_mode"] = "both"
+        self.context["manifest"]["analysis"]["monogenic"]["enabled"] = True
+        scores = self.cache / "scores.txt.gz"
+        with gzip.open(scores, "wt") as handle:
+            handle.write("sampleset\tPGS\tIID\tSUM\tDENOM\tAVG\ttrait\n")
+            for index in range(1, 26):
+                trait = "Example | trait" if index == 1 else ""
+                handle.write(f"target\tPGS{999000 + index}_hmPOS_GRCh38\tTEST\t1.234\t196\t0.006296\t{trait}\n")
+            handle.write("reference\tPGS999001_hmPOS_GRCh38\tREFERENCE_SAMPLE\t100\t2\t50\tReference\n")
+        matching = self.fixture("match_summary.csv", "dataset,accession,match_status,count\n"
+                                "target,PGS999001,matched,98\ntarget,PGS999001,excluded,1\n"
+                                "target,PGS999001,unmatched,1\ntarget,PGS999001,not_best,20\n"
+                                "reference,PGS999001,matched,75\nreference,PGS999001,unmatched,25\n")
+        dense = self.fixture("dense.vcf.gz")
+        imputed = self.fixture("imputed.vcf.gz")
+        annotated = self.fixture("annotated.vcf.gz")
+        monogenic = {"status": "ok", "summary": {"priority_rows_after_dedup": 2, "total_variant_records_seen": 5},
+                     "artifacts": {"annotated_vcf": annotated, "priority_variants_tsv": self.fixture("priority.tsv")},
+                     "import_details": {"source": "/originals/source.vcf.gz", "trusted_provenance": False}}
+        prs = {
+            "status": "ok", "dense_genotypes": {"artifacts": {"dense_vcf": dense}},
+            "imputed_genotypes": {"artifacts": {"imputed_vcf": imputed}},
+            "artifacts": {"aggregated_scores": str(scores), "match_summary": matching},
+            "summary": {"num_requested_scores": 26, "genotype_qc": {"total_sites": 100, "callable_sites": 98, "missing_sites": 2},
+                        "overlap_failures": [{"score": "PGS999999_hmPOS_GRCh38", "match_percent": "51.00"}]},
+        }
+        text, summary = self.render(prs, monogenic)
+        self.assertIn("Genome Report: TEST", text)
+        self.assertLess(text.index("## PRS Results"), text.index("## Execution Details"))
+        self.assertIn("Calculated 25 score rows from 26 requested scores", text)
+        self.assertIn("1 reference-panel rows", text)
+        self.assertNotIn("REFERENCE_SAMPLE", text)
+        self.assertIn("| PGS999025_hmPOS_GRCh38 |", text)
+        self.assertEqual(text.count("| PGS999001_hmPOS_GRCh38 |"), 1)
+        self.assertIn("| Example \\| trait | TEST | 1.234 | 196 | 0.006296 | 98 / 100 | 98.00 |", text)
+        self.assertIn("| PGS999999_hmPOS_GRCh38 | 51.00 |", text)
+        self.assertIn("No reference calibration was requested", text)
+        self.assertIn("are not absolute disease probabilities", text)
+        self.assertIn("Per-score genotype missingness was not reported", text)
+        self.assertIn("98 callable, 2 missing out of 100 sites", text)
+        self.assertIn("not per-score coverage", text)
+        self.assertIn("## Monogenic", text)
+        self.assertEqual(summary["overall_status"], "ok")
+        self.assertTrue((self.results / "prs" / "aggregated_scores.txt.gz").is_file())
+        self.assertTrue((self.results / "monogenic" / "priority_variants.tsv").is_file())
+        self.assertEqual(list(self.results.rglob("*.vcf.gz")), [])
+        self.assertEqual(list(self.results.rglob("*.tbi")), [])
+        self.assertFalse((self.results / "manifests").exists())
+        self.assertNotIn("/private/reference.fa", text)
+        provenance = json.loads((self.results / "report" / "artifact_manifest.json").read_text())
+        self.assertEqual(provenance["prs_stage"]["dense_genotypes"]["artifacts"]["dense_vcf"], dense)
+        self.assertEqual(provenance["prs_stage"]["imputed_genotypes"]["artifacts"]["imputed_vcf"], imputed)
+        self.assertEqual(provenance["monogenic_stage"]["artifacts"]["annotated_vcf"], annotated)
+        self.assertEqual(provenance["monogenic_stage"]["import_details"], monogenic["import_details"])
+        # Restarting report publication must not recopy unchanged companions.
+        with patch("workflow.reporting.report.atomic_copy", wraps=atomic_copy) as copier:
+            self.render(prs, monogenic)
+        copier.assert_not_called()
 
-            context_path = tmp / "context.json"
-            monogenic_path = tmp / "monogenic.json"
-            prs_path = tmp / "prs.json"
-            summary_path = tmp / "summary.json"
-            for path, payload in [
-                (context_path, context),
-                (monogenic_path, monogenic),
-                (prs_path, prs),
-            ]:
-                path.write_text(json.dumps(payload), encoding="utf-8")
+    def test_cli_reports_failed_scores_and_enforces_failure(self) -> None:
+        prs = {"status": "failed", "message": "No scores met the matching threshold.",
+               "diagnostics": {"overlap_failures": [{"score": "PGS999001", "match_percent": "67.56"}]}}
+        paths = [self.root / name for name in ("context.json", "monogenic.json", "prs.json")]
+        for path, payload in zip(paths, [self.context, {"status": "skipped"}, prs]):
+            path.write_text(json.dumps(payload))
+        summary_path = self.root / "summary.json"
+        result = subprocess.run([sys.executable, "-m", "workflow.reporting.report", "render", "--context", str(paths[0]),
+                                 "--monogenic-stage", str(paths[1]), "--prs-stage", str(paths[2]), "--output", str(summary_path)],
+                                cwd=REPO_ROOT, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = (self.results / "report" / "report.md").read_text()
+        self.assertIn("No final PRS scores are available", text)
+        self.assertIn("| PGS999001 | 67.56 |", text)
+        self.assertNotIn("## Monogenic", text)
+        summary = json.loads(summary_path.read_text())
+        self.assertEqual(summary["failed_enabled_stages"], ["prs"])
+        with self.assertRaises(SystemExit):
+            enforce_outcome(summary)
 
-            subprocess.run(
-                [
-                    "python3",
-                    "-m",
-                    "workflow.reporting.report",
-                    "render",
-                    "--context",
-                    str(context_path),
-                    "--monogenic-stage",
-                    str(monogenic_path),
-                    "--prs-stage",
-                    str(prs_path),
-                    "--output",
-                    str(summary_path),
-                ],
-                cwd=REPO_ROOT,
-                env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
-                check=True,
-            )
-
-            report_path = report_dir / "report.md"
-            self.assertTrue(report_path.exists())
-            report_text = report_path.read_text(encoding="utf-8")
-            self.assertIn("Genome Report: TEST", report_text)
-            self.assertIn("Execution mode: `both`", report_text)
-            self.assertIn("CRAM input: `C:\\Data\\sample.cram`", report_text)
-            self.assertIn("Active CRAM path: `/home/user/.cache/genomics/staging/sample.cram`", report_text)
-            self.assertIn("Reference probe: `ok`", report_text)
-            self.assertIn("PRS scaffold stage: `ok`", report_text)
-            self.assertIn("Reference DB backbone: `pgsc_HGDP+1kGP_v1`", report_text)
-            self.assertIn(f"PRS scaffold VCF: `{tmp / 'cache' / 'dense.vcf.gz'}`", report_text)
-            self.assertIn(f"Reference DB archive: `{tmp / 'cache' / 'pgsc_HGDP+1kGP_v1.tar.zst'}`", report_text)
-            self.assertIn("Accepted rows rescued by strand complement: `222`", report_text)
-            self.assertIn(f"Pre-match audit TSV: `{tmp / 'cache' / 'pre_match_audit.tsv'}`", report_text)
-            self.assertIn("Accepted score rows by source: `explicit_other_allele`=12000, `hm_inferOtherAllele`=345", report_text)
-            self.assertIn("Import stage manifest: `/external/annotated.stage_manifest.json`", report_text)
-            self.assertIn("Scaffold import note: external import without repo-generated stage manifest", report_text)
-            self.assertIn(f"Imputed PRS VCF: `{tmp / 'cache' / 'imputed.vcf.gz'}`", report_text)
-            self.assertIn("Imputation backend: `beagle`", report_text)
-            self.assertIn("Imputation panel: `grch38_beagle_panel`", report_text)
-            self.assertIn("Imputed genotype import note: external import without repo-generated stage manifest", report_text)
-            self.assertIn(f"Match diagnostics JSON: `{tmp / 'cache' / 'match_diagnostics.json'}`", report_text)
-            self.assertIn("pgsc_calc input format: `pfile`", report_text)
-            self.assertIn(f"Scoring input PGEN: `{tmp / 'cache' / 'scoring_input.pgen'}`", report_text)
-            self.assertIn(f"Scoring input PSAM: `{tmp / 'cache' / 'scoring_input.psam'}`", report_text)
-            self.assertIn(f"Scoring input PVAR: `{tmp / 'cache' / 'scoring_input.pvar.zst'}`", report_text)
-            self.assertIn(f"Normalized scoring VCF: `{tmp / 'cache' / 'normalized_scoring.vcf.gz'}`", report_text)
-            self.assertIn("Scoring contigs normalized for pgsc_calc: `True`", report_text)
-            self.assertTrue((results_dir / "monogenic" / "annotated.vcf.gz").exists())
-            self.assertTrue((results_dir / "monogenic" / "annotated.vcf.gz.tbi").exists())
-            self.assertTrue((results_dir / "prs" / "pre_match_audit.tsv").exists())
-            self.assertTrue((results_dir / "prs" / "match_diagnostics.json").exists())
-            self.assertTrue((results_dir / "prs" / "imputed_prs.vcf.gz").exists())
-            self.assertTrue((results_dir / "prs" / "prs_scaffold.vcf.gz").exists())
-
-    def test_render_report_prs_only_omits_monogenic_section(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            results_dir = tmp / "results" / "TEST" / "latest"
-            report_dir = results_dir / "report"
-            manifests_dir = results_dir / "manifests"
-            report_dir.mkdir(parents=True, exist_ok=True)
-            manifests_dir.mkdir(parents=True, exist_ok=True)
-
-            context = {
-                "sample_id": "TEST",
-                "execution_mode": "prs-only",
-                "input_fingerprint": {"id": "fingerprint"},
-                "inputs": {
-                    "original": {"cram": "C:\\Data\\sample.cram", "crai": "C:\\Data\\sample.cram.crai"},
-                    "active": {"cram": "/cache/sample.cram", "crai": "/cache/sample.cram.crai"},
-                    "staged": {"cram": True, "crai": True},
-                },
-                "runtime": {"linux_cache_root": "/home/user/.cache/genomics"},
-                "results": {
-                    "run_dir": str(results_dir),
-                    "report_dir": str(report_dir),
-                    "manifests_dir": str(manifests_dir),
-                },
-                "manifest": {
-                    "analysis": {
-                        "monogenic": {"enabled": False},
-                        "prs": {"enabled": True},
-                    },
-                },
-                "reference_probe": {"status": "ok", "summary": {}, "provenance_hints": {}, "remote_decode_probe": {"status": "ok"}},
-                "reference_bundle": {"status": "ready"},
-            }
-            monogenic = {"status": "skipped", "message": "Monogenic stage disabled."}
-            prs = {
-                "status": "failed",
-                "dense_genotypes": {
-                    "status": "ok",
-                    "summary": {
-                        "reference_db": "pgsc_HGDP+1kGP_v1",
-                        "scaffold_sites": 100,
-                        "accepted_rows_by_source": {"explicit_other_allele": 90},
-                        "skipped_reasons": {"missing_other_allele": 10},
-                    },
-                    "artifacts": {
-                        "pre_match_audit_tsv": "/cache/pre_match_audit.tsv",
-                        "pre_match_audit_json": "/cache/pre_match_audit.json",
-                    },
-                },
-                "diagnostics": {
-                    "overlap_failures": [
-                        {"score": "PGS999001_hmPOS_GRCh38", "match_percent": "67.56"},
-                        {"score": "PGS999002_hmPOS_GRCh38", "match_percent": "53.29"},
-                    ],
-                    "log_path": "/cache/pgsc_calc.log",
-                    "renamed_chr_prefix": True,
-                },
-                "artifacts": {
-                    "match_diagnostics_json": "/cache/match_diagnostics.json",
-                    "overlap_failures_tsv": "/cache/overlap_failures.tsv",
-                    "match_summary": "/cache/match_summary.csv",
-                    "normalized_scoring_input_vcf": "/cache/normalized_scoring.vcf.gz",
-                },
-            }
-
-            context_path = tmp / "context.json"
-            monogenic_path = tmp / "monogenic.json"
-            prs_path = tmp / "prs.json"
-            summary_path = tmp / "summary.json"
-            for path, payload in [(context_path, context), (monogenic_path, monogenic), (prs_path, prs)]:
-                path.write_text(json.dumps(payload), encoding="utf-8")
-
-            subprocess.run(
-                [
-                    "python3",
-                    "-m",
-                    "workflow.reporting.report",
-                    "render",
-                    "--context",
-                    str(context_path),
-                    "--monogenic-stage",
-                    str(monogenic_path),
-                    "--prs-stage",
-                    str(prs_path),
-                    "--output",
-                    str(summary_path),
-                ],
-                cwd=REPO_ROOT,
-                env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
-                check=True,
-            )
-
-            report_text = (report_dir / "report.md").read_text(encoding="utf-8")
-            self.assertIn("PRS Report: TEST", report_text)
-            self.assertIn("Execution mode: `prs-only`", report_text)
-            self.assertNotIn("## Monogenic", report_text)
-            self.assertIn("## PRS", report_text)
-            self.assertIn("Scoring contigs normalized for pgsc_calc: `True`", report_text)
-            self.assertIn("Match threshold summary TSV: `/cache/overlap_failures.tsv`", report_text)
-            self.assertIn("| PGS999001_hmPOS_GRCh38 | 67.56 |", report_text)
+    def test_incomplete_stage_cannot_be_reported_as_success(self) -> None:
+        _, summary = self.render({"status": "interrupted"})
+        self.assertEqual(summary["overall_status"], "failed")
+        self.assertEqual(summary["failed_enabled_stages"], ["prs"])
 
 
 if __name__ == "__main__":

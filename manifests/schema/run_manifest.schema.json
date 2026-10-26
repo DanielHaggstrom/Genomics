@@ -31,6 +31,12 @@
         "crai": {
           "type": "string",
           "minLength": 1
+        },
+        "protected_roots": {
+          "type": "array",
+          "description": "Additional original-data directory trees that must never contain runtime state or results. CRAM/CRAI parent directories are protected automatically.",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
         }
       }
     },
@@ -74,17 +80,12 @@
         },
         "bundle_id": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
         },
         "bundle_manifest": {
           "type": "string",
           "minLength": 1
-        },
-        "autodownload": {
-          "type": "boolean"
-        },
-        "remote_decode_probe": {
-          "type": "boolean"
         }
       }
     },
@@ -187,6 +188,16 @@
               "type": "number",
               "minimum": 0.0,
               "maximum": 1.0
+            },
+            "min_depth": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Minimum sample depth for directly called PRS genotypes. Lower-quality observations remain missing."
+            },
+            "min_gq": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Minimum GQ or reference-genotype RGQ for directly called PRS genotypes."
             },
             "workers": {
               "type": [
@@ -301,7 +312,8 @@
         },
         "run_id": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
         }
       }
     }

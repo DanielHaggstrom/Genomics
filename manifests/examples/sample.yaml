@@ -1,37 +1,26 @@
 sample_id: DEMO_SAMPLE_001
 
 inputs:
-  cram: /mnt/c/path/to/DEMO_SAMPLE_001.cram
-  crai: /mnt/c/path/to/DEMO_SAMPLE_001.cram.crai
+  cram: /data/wgs/sample.cram
+  crai: /data/wgs/sample.cram.crai
+  protected_roots: [/data/wgs]
 
 reference:
   build: GRCh38
   bundle_id: grch38_dragen_alt_masked
-  autodownload: false
-  remote_decode_probe: false
+  # Use a private bundle manifest pointing at the exact CRAM reference.
+  bundle_manifest: ../local/reference_bundles/grch38_dragen_alt_masked.yaml
 
 analysis:
-  monogenic:
-    enabled: true
-    mode: moderate
-    max_af: 0.05
-    vep_forks: 8
   prs:
-    enabled: true
-    score_preset: demo
-    sample_sex: male
-    run_ancestry: false
-    reference_db: pgsc_HGDP+1kGP_v1
-    min_overlap: 0.75
+    score_preset: demo  # Placeholder IDs; replace with real scores before running.
+    # Optional: enable imputation only after supplying a compatible local panel.
     imputation:
-      enabled: true
-      backend: beagle
-      reference_panel: grch38_beagle_panel
-      info_threshold: 0.8
-      dosage_field: DS
+      enabled: false
+  monogenic:
+    enabled: false
 
 runtime:
-  profile: docker
   max_memory: 14.GB
   max_cpus: 8
   min_free_gb: 40

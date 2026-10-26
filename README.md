@@ -1,244 +1,126 @@
 # Genomics
 
-Single-sample, research-use genome analysis from `CRAM/CRAI` to:
-- monogenic triage
-- broad PRS scaffold genotypes plus optional PRS imputation and PRS scoring
-- one final Markdown report
+Single-sample research analysis of WGS, centered on calculating polygenic scores
+without losing completed work when a long run stops.
 
-Supported execution modes:
-- `both`
-- `monogenic-only`
-- `prs-only`
+`CRAM/CRAI → reference validation → scaffold genotypes → optional imputation → PRS scoring → one report`
 
-## Scope
+PRS is enabled by default. Monogenic SNV/indel triage and PRS-only Beagle imputation
+are optional. There are no clinical diagnosis, SV/CNV, or pedigree workflows.
+Implementation and synthetic checks are in place; actual caller/scorer integration
+and results from personal data remain unvalidated. Do not interpret raw PGS sums
+as absolute disease probabilities.
 
-Supported:
-- one sample at a time
-- CRAM-first SNV/indel monogenic triage
-- PRS from a broad common-variant scaffold generated from the CRAM
-- optional PRS-only imputation on that scaffold for better score portability
-- explicit stage-boundary imports for:
-  - called VCF
-  - annotated VCF
-  - PRS scaffold VCF
-  - imputed PRS VCF
+## Configure
 
-Out of scope:
-- clinical diagnosis
-- SV/CNV pipelines
-- trio/family workflows
-- general-purpose bioinformatics utilities unrelated to the above
+Keep original downloads outside the repository. Their directory is protected from
+runtime/output writes automatically. Add any larger original-data tree to
+`inputs.protected_roots`; the pipeline treats its contents as read-only, including
+files whose provenance is uncertain. Missing reference/import indexes are generated
+on cache copies. Generated state belongs in `~/.cache/genomics`, separate from originals.
 
-## Run
+Copy [the example manifest](manifests/examples/sample.yaml) into ignored
+`manifests/local/`, and set the CRAM/CRAI paths, real PGS Catalog score IDs
+(`analysis.prs.pgs_ids`), resource budget, and exact reference bundle. The demo
+preset contains a placeholder ID and is for manifest validation only.
 
-Preferred command:
+Copy [the reference example](manifests/examples/reference_bundles/grch38_dragen_alt_masked.yaml)
+into `manifests/local/reference_bundles/` and supply the original reference FASTA,
+FAI, and dictionary paths. Set `reference.bundle_manifest` relative to your run
+manifest. A similarly named GRCh38 reference is insufficient: the dictionary must
+match the CRAM contig lengths and MD5s. Reference downloading/remote probing is
+intentionally absent; an explicit validated local bundle is required for calling.
+Remove retired `reference.autodownload` and `reference.remote_decode_probe` keys
+from older manifests.
 
-```bash
-bash run.sh manifests/local/<sample>.yaml
-```
+Python dependencies are in [requirements.txt](requirements.txt). Runtime tools are
+Docker, samtools, bcftools, and tabix; PRS also needs Java, Nextflow, and curl.
+Building the broad scaffold or ancestry calibration needs tar and zstd. Optional
+VEP annotation needs curl and tar. Preparation checks tools before staging large
+inputs. Linux path/tool migration beyond this launcher remains a separate task;
+legacy WSL staging and Docker compatibility helpers are retained for now.
 
-Resume-friendly form:
+## Run, stop, resume
 
-```bash
-bash run.sh manifests/local/<sample>.yaml -resume
-```
-
-Direct command:
-
-```bash
-nextflow run . -params-file manifests/local/<sample>.yaml -profile docker
-```
-
-The wrapper resolves the Linux-side cache root from the manifest and keeps Nextflow runtime state there, so the repo only keeps final results.
-
-## Pipeline Shape
-
-Canonical path:
-
-```text
-CRAM/CRAI
--> validated manifest
--> prepared context (reference probe + bundle validation + WSL-native staging)
--> monogenic stage
--> PRS scaffold stage
--> optional PRS imputation stage
--> PRS scoring
--> one report
-```
-
-Reuse is allowed only at explicit stage boundaries:
-- `reuse.called_vcf`
-- `reuse.annotated_vcf`
-- `reuse.prs_dense_vcf`
-- `reuse.imputed_prs_vcf`
-
-Those imports do not create alternate execution graphs. They only skip the stage that would normally generate the same artifact.
-
-For compatibility, the manifest key `reuse.prs_dense_vcf` is still accepted, but the intended meaning is now the PRS scaffold artifact rather than the older PRS-targeted dense VCF concept.
-
-## Repo Layout
-
-- `main.nf`: the pipeline graph
-- `nextflow.config`: Nextflow runtime settings
-- `run.sh`: the only user-facing shell entrypoint
-- `AGENTS.md`: shared repo instructions for Codex/agents
-- `PLANS.md`: shared execution roadmap for larger work
-- `manifests/`: tracked examples plus schema; private manifests live under ignored `manifests/local/`
-- `workflow/core/`: manifest, runtime, and reference/context logic
-- `workflow/stages/`: monogenic and PRS stage implementations
-- `workflow/reporting/`: report rendering and outcome enforcement
-- `tests/`: unit tests
-- `output/results/`: final run outputs only
-
-The heavy runtime/cache state lives under `runtime.linux_cache_root`, not in the repo.
-
-`AGENTS.md` and `PLANS.md` are meant to be tracked. They document shared project guidance and the current narrow roadmap. Personal manifests, private presets, raw data, and generated outputs should remain untracked.
-
-## Manifest
-
-Example tracked manifest:
-- `manifests/examples/sample.yaml`
-- `manifests/examples/sample.monogenic.yaml`
-- `manifests/examples/sample.prs.yaml`
-
-Main fields:
-- `sample_id`
-- `inputs.cram`
-- `inputs.crai`
-- `reference.build`
-- `reference.bundle_id`
-- `analysis.monogenic`
-- `analysis.prs`
-- `analysis.prs.reference_db`
-- `analysis.prs.sample_sex`
-- `analysis.prs.imputation`
-- `analysis.monogenic.workers`
-- `analysis.monogenic.pairhmm_threads`
-- `analysis.prs.workers`
-- `analysis.prs.pairhmm_threads`
-- `runtime.linux_cache_root`
-- `outputs.results_dir`
-
-PRS score lists can come from either:
-- `analysis.prs.score_preset`
-- `analysis.prs.pgs_ids`
-
-Execution mode is derived from the enabled analysis branches:
-- `analysis.monogenic.enabled: true` and `analysis.prs.enabled: true` -> `both`
-- `analysis.monogenic.enabled: true` and `analysis.prs.enabled: false` -> `monogenic-only`
-- `analysis.monogenic.enabled: false` and `analysis.prs.enabled: true` -> `prs-only`
-
-The pipeline intentionally rejects manifests where both branches are disabled.
-
-If `analysis.prs.sample_sex` is set to `male` or `female`, the PRS compatibility step keeps sex chromosomes and writes a one-sample `.psam` for downstream tools. If it is omitted, PRS compatibility falls back to autosomes only.
-
-`analysis.prs.reference_db` defines the common-variant backbone used to build the PRS scaffold. The intended GRCh38 default is `pgsc_HGDP+1kGP_v1`, which matches the PGS Catalog calculator ecosystem and gives the PRS path a broad target-genome surface instead of only the requested score loci.
-
-The worker and `pairhmm_threads` fields are optional narrow overrides. If omitted, the pipeline now chooses them automatically from:
-- `runtime.max_cpus`
-- `runtime.max_memory`
-- shard count for the stage
-- current free-disk headroom relative to `runtime.min_free_gb`
-
-The default behavior is to use the automatic planner and only set those fields when you need to tune a run deliberately.
-
-PRS imputation is now an explicit compatibility surface:
-- `analysis.prs.imputation.enabled: true` signals that PRS should use an imputed scaffold path
-- `reuse.imputed_prs_vcf` lets you score a precomputed imputed PRS VCF as a stage-boundary import
-- the local backend now expects `analysis.prs.imputation.reference_panel` to point at a panel manifest ID or YAML path
-- the first local backend is a single-sample Beagle path against a per-chromosome phased reference panel, operating on the scaffold backbone rather than a PRS-targeted site list
-- because this repo is single-sample, the first local backend does not run `conform-gt`; the official `conform-gt` docs say its statistical strand checks require at least 20 target samples
-- tracked example panel manifests live under `manifests/examples/imputation_panels/`
-- local panel manifests belong under ignored `manifests/local/imputation_panels/`
-
-The important design shift is:
-- WGS already contains the underlying DNA information
-- the difficult part is representing that information on the standardized common-variant surface that `pgsc_calc` expects
-- this repo now treats that scaffold-first path as the intended PRS strategy instead of trying to score directly from a PRS-targeted genotype subset
-
-Tracked example presets live in:
-- `manifests/examples/score_presets.yaml`
-
-Private sample manifests, private reference bundle manifests, and private score presets belong under ignored `manifests/local/`.
-
-## Reference Bundles
-
-CRAM-based stages require the exact reference used for alignment.
-
-The pipeline now handles that in `PREPARE_CONTEXT` by:
-- probing the CRAM header
-- extracting contig MD5s and provenance hints
-- validating a local FASTA/FAI/dict bundle against the CRAM header
-- staging heavy reference files into Linux-native cache when needed
-
-Optional remote MD5 decode probing is available for diagnostics, but it does not replace a validated local bundle.
-
-Tracked example:
-- `manifests/examples/reference_bundles/grch38_dragen_alt_masked.yaml`
-- `manifests/examples/imputation_panels/grch38_beagle_panel.yaml`
-
-## Outputs
-
-Final reader-facing result:
-- `output/results/<sample>/<run_id>/report/report.md`
-
-The report title and sections adapt to the execution mode:
-- `Genome Report` for `both`
-- `Monogenic Report` for `monogenic-only`
-- `PRS Report` for `prs-only`
-
-Technical manifests:
-- `output/results/<sample>/<run_id>/report/artifact_manifest.json`
-
-Heavy cache/work state:
-- `<runtime.linux_cache_root>/<project-cache-id>/...`
-
-## Performance Model
-
-The pipeline automatically stages heavy inputs from `/mnt/c/...` or Windows paths into Linux-native cache, then runs heavy work there.
-
-Performance-sensitive stages are structured as scatter/gather:
-- monogenic calling is sharded by chromosome plus one `alt` shard
-- dense PRS genotyping is sharded by chromosome plus one `alt` shard
-
-Worker selection is also automatic now:
-- monogenic and PRS scaffold-building stages size their worker pools from available CPU, memory, shard count, and disk headroom
-- optional per-stage overrides stay narrow and explicit in the manifest
-- live tuning during a run is not supported yet; the sane operator path is still stop, adjust settings, and relaunch with cache reuse
-
-Useful operator commands:
+When ready to authorize a real run:
 
 ```bash
-make status RUN=manifests/local/<sample>.yaml
-docker stats
+bash run.sh manifests/local/sample.yaml
 ```
 
-`make status` prints:
-- the project cache root
-- the active `nextflow.log`
-- the monogenic stage status manifest path
-- the PRS stage status manifest path
+Use Ctrl-C or SIGTERM to stop. Run the same command to resume; there is no separate
+resume mode (`-resume` is accepted for compatibility). Active child process groups
+and directly launched Docker containers are stopped. Completed chromosome/task
+checkpoints remain; an interrupted caller task restarts from its last completed
+boundary. This is task-level resume, not continuation inside GATK or Beagle.
+Power loss/SIGKILL cannot perform cleanup, so verify orphaned tools have stopped
+before restarting after an unclean shutdown.
 
-The long-running monogenic and PRS stages now update their cache-side status manifests while they are still running, including:
-- current phase
-- total and completed shard counts
-- last completed shard
-- the active worker plan when shard work is underway
+Checkpoints are written atomically after successful commands and fingerprint
+nonempty outputs plus required indexes. An interrupted output without a valid
+receipt is rebuilt. Legacy outputs lacking receipts may be recomputed once.
+Downloads retain `.part` files and request HTTP range continuation on restart.
+The server must support range requests. Completed whole-contig gVCFs are shared
+across score selections and the optional monogenic branch. Changing data or analysis
+settings selects the dependent cache paths; completed work is retained.
 
-That avoids the earlier design where PRS walked chromosomes in one long serial shell loop and monogenic ran as one giant whole-genome caller task.
-
-## Development
+One local Python driver runs stages sequentially. A cache lock rejects a second
+writer. The pinned upstream `pgsc_calc` v2.3.0 retains its own Nextflow work and
+always uses `-resume`; CPU and memory budgets apply to its local executor too.
+Scorer containers carry a stable cache-specific label for bounded cleanup after
+interruption, using [Nextflow Docker options](https://docs.seqera.io/nextflow/reference/config/docker).
+Changing resource settings takes effect on restart. Concurrent analyses against
+different caches must also use different result directories/run IDs.
 
 ```bash
-make validate
+make status RUN=manifests/local/sample.yaml
+```
+
+Status reads saved run/stage metadata without scanning genomic data. Logs stream
+to cache files while tools run. After an unclean shutdown, saved status can still
+say `running`; it records the last update, not a process liveness monitor.
+
+## Genotypes and results
+
+Direct PRS calling uses a broad common-variant backbone plus score-specific sites,
+finalizes gVCFs at those sites, and reconstructs explicit alleles for confident
+reference SNP calls. It preserves depth and GQ/RGQ; defaults require DP ≥ 10 and
+GQ/RGQ ≥ 20. Missing/uncertain observations are excluded from the scoring copy.
+Indel absence is not inferred from an ordinary reference SNP call. Direct calling
+and local imputation currently support diploid autosomes; validated imported
+sex-chromosome calls require explicit sample sex.
+
+Enable `analysis.prs.imputation.enabled` only after supplying a compatible phased
+panel using [the panel example](manifests/examples/imputation_panels/grch38_beagle_panel.yaml).
+Imputation augments the scaffold, retaining confident direct observations and
+sites absent from the panel. Inspect per-score matching and missing high-weight
+variants; the overlap cutoff is a failure gate, not proof of score validity.
+Ancestry/reference calibration is separately enabled with `run_ancestry`.
+
+Explicit stage-boundary imports are `reuse.called_vcf`, `reuse.annotated_vcf`,
+`reuse.prs_dense_vcf` (scaffold), and `reuse.imputed_prs_vcf`. Avoid importing a
+sparse variants-only VCF as if it contained confident reference observations.
+
+The reader-facing report is
+`output/results/<sample_id>/<run_id>/report/report.md`, with score/QC tables and
+one `artifact_manifest.json` containing complete provenance and canonical cache
+paths. Large genotype VCFs stay in the cache. An enabled failed/incomplete stage
+makes the run fail, while available failure details remain in the report.
+
+## Maintenance
+
+```bash
 make test
-make clean
-make clean-cache
+make validate
+make validate-manifest RUN=manifests/examples/sample.yaml
 ```
 
-`make clean` removes repo-facing results only.  
-`make clean-cache` removes Linux-side cache/work state for this project.
+Tests use synthetic data, mocked biological tools, and short Python subprocesses
+for interruption checks. They do not run the WGS pipeline. The next acceptance
+gate is a bounded synthetic or truth-known-region test of the real external tools,
+then a manageable score with independently checked genotypes and arithmetic.
 
-## License
-
-MIT. See [LICENSE](LICENSE).
+`make clean` removes default published results. `make clean-cache RUN=...` removes
+this project's cache and **discards resumable work**; `make clean-all` does both.
+Neither is a normal stop/resume step. Private manifests, original data, personal
+score presets, results, and runtime state must stay out of Git.

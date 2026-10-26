@@ -7,10 +7,14 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import uuid
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from typing import Any, Callable, Iterable
 
 import yaml
@@ -35,22 +39,24 @@ def load_json(path: str | pathlib.Path) -> Any:
 def write_json(path: str | pathlib.Path, payload: Any) -> None:
     destination = pathlib.Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with open(destination, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=destination.parent, delete=False) as handle:
+            temporary = pathlib.Path(handle.name)
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def ensure_dir(path: str | pathlib.Path) -> pathlib.Path:
     destination = pathlib.Path(path)
     destination.mkdir(parents=True, exist_ok=True)
     return destination
-
-
-def read_text_if_exists(path: str | pathlib.Path) -> str | None:
-    target = pathlib.Path(path)
-    if not target.exists():
-        return None
-    return target.read_text(encoding="utf-8")
 
 
 def is_windows_path(raw: str) -> bool:
@@ -143,13 +149,24 @@ def sample_file_fingerprint(path: str | pathlib.Path, *, chunk_size: int = 1024 
     }
 
 
-def artifacts_exist(paths: Iterable[str | None]) -> bool:
-    for raw in paths:
-        if not raw:
-            continue
-        if not pathlib.Path(raw).exists():
-            return False
-    return True
+def germline_gvcf_dir(
+    cache_root: str | pathlib.Path, *, cram_path: str | pathlib.Path,
+    reference_fasta: str | pathlib.Path, image: str, intervals: Iterable[str],
+) -> pathlib.Path:
+    """Shared whole-interval HaplotypeCaller output, independent of selected scores."""
+    key = hash_strings([
+        "germline-gvcf-v1", sample_file_fingerprint(cram_path)["id"],
+        sample_file_fingerprint(reference_fasta)["id"], image, *intervals,
+    ])
+    return ensure_dir(pathlib.Path(cache_root) / key)
+
+
+def artifacts_exist(paths: Iterable[str | pathlib.Path | None]) -> bool:
+    required = list(paths)
+    return bool(required) and all(
+        raw and pathlib.Path(raw).is_file() and pathlib.Path(raw).stat().st_size > 0
+        for raw in required
+    )
 
 
 def infer_index_path(path: str | pathlib.Path) -> pathlib.Path | None:
@@ -164,9 +181,11 @@ def infer_index_path(path: str | pathlib.Path) -> pathlib.Path | None:
     return None
 
 
-def complete_artifact(main_path: str | pathlib.Path, *, extra_sidecars: Iterable[str | pathlib.Path] | None = None) -> bool:
+def complete_artifact(main_path: str | pathlib.Path | None, *, extra_sidecars: Iterable[str | pathlib.Path] | None = None) -> bool:
+    if not main_path:
+        return False
     target = pathlib.Path(main_path)
-    if not target.exists():
+    if not target.is_file() or target.stat().st_size == 0:
         return False
     sidecars = []
     inferred = infer_index_path(target)
@@ -174,16 +193,90 @@ def complete_artifact(main_path: str | pathlib.Path, *, extra_sidecars: Iterable
         sidecars.append(inferred)
     if extra_sidecars:
         sidecars.extend(pathlib.Path(p) for p in extra_sidecars)
-    return all(sidecar.exists() for sidecar in sidecars)
+    return all(sidecar.is_file() and sidecar.stat().st_size > 0 for sidecar in sidecars)
 
 
 def complete_artifacts_exist(paths: Iterable[str | pathlib.Path | None]) -> bool:
-    for raw in paths:
-        if not raw:
-            continue
-        if not complete_artifact(raw):
-            return False
-    return True
+    required = list(paths)
+    return bool(required) and all(complete_artifact(raw) for raw in required)
+
+
+def checkpoint_complete(receipt: str | pathlib.Path, artifacts: Iterable[str | pathlib.Path]) -> bool:
+    paths = list(artifacts)
+    try:
+        return artifacts_exist(paths) and load_json(receipt) == {
+            "artifacts": [sample_file_fingerprint(path) for path in paths],
+        }
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def record_checkpoint(receipt: str | pathlib.Path, artifacts: Iterable[str | pathlib.Path]) -> None:
+    paths = list(artifacts)
+    if not artifacts_exist(paths):
+        raise ValueError("Cannot checkpoint missing or empty outputs")
+    write_json(receipt, {"artifacts": [sample_file_fingerprint(path) for path in paths]})
+
+
+_ACTIVE_COMMANDS: dict[subprocess.Popen, tuple[str, str] | None] = {}
+_COMMAND_LOCK = threading.Lock()
+_CANCEL_COMMANDS = threading.Event()
+
+
+def check_cancelled() -> None:
+    if _CANCEL_COMMANDS.is_set():
+        raise CancelledError("Analysis cancelled")
+
+
+def _stop_command(process: subprocess.Popen, container: tuple[str, str] | None) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    # Docker containers belong to the daemon, not the client's process group.
+    # Each run has a unique name, so cancellation can remove only its own container.
+    if container is not None:
+        try:
+            subprocess.run([container[0], "rm", "-f", container[1]], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=5, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def cancel_commands() -> None:
+    with _COMMAND_LOCK:
+        _CANCEL_COMMANDS.set()
+        commands = list(_ACTIVE_COMMANDS.items())
+    for process, container in commands:
+        _stop_command(process, container)
+
+
+@contextmanager
+def interruptible_commands():
+    """One analysis run: turn stop signals into cleanup of its active commands."""
+    def interrupted(_signum, _frame):
+        raise KeyboardInterrupt("Analysis interrupted")
+    previous = {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)}
+    for signum in previous:
+        signal.signal(signum, interrupted)
+    _CANCEL_COMMANDS.clear()
+    try:
+        yield
+    except BaseException:
+        cancel_commands()
+        raise
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+        _CANCEL_COMMANDS.clear()
 
 
 def run_command(
@@ -194,45 +287,93 @@ def run_command(
     log_path: str | pathlib.Path | None = None,
     check: bool = True,
     timeout: int | float | None = None,
+    capture_output: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    final_env = os.environ.copy()
-    if env:
-        final_env.update(env)
+    """Run a cancellable command; long-running command output goes straight to disk.
 
-    completed = subprocess.run(
-        args,
-        cwd=str(cwd) if cwd else None,
-        env=final_env,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout,
-    )
+    Without a log path, output is captured as before. Logged commands return only
+    a bounded diagnostic tail unless capture_output=True requests their full stdout.
+    """
+    final_env = {**os.environ, **(env or {})}
+    command = list(args)
+    container = None
+    if pathlib.Path(command[0]).name in {"docker", "docker.exe"} and command[1:2] == ["run"]:
+        container = (command[0], "genomics-" + uuid.uuid4().hex)
+        command[2:2] = ["--name", container[1]]
+    log = None
+    process = None
+    try:
+        if log_path is not None:
+            path = pathlib.Path(log_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            log = path.open("w", encoding="utf-8")
+            log.write("$ " + " ".join(command) + "\n")
+            log.flush()
+        with _COMMAND_LOCK:
+            check_cancelled()
+            process = subprocess.Popen(
+                command, cwd=str(cwd) if cwd else None, env=final_env, text=True,
+                stdout=subprocess.PIPE if log is None or capture_output else log,
+                stderr=subprocess.PIPE if log is None else log, start_new_session=True,
+            )
+            _ACTIVE_COMMANDS[process] = container
+        stdout, stderr = process.communicate(timeout=timeout)
+        if log is not None:
+            if stdout:
+                log.write(stdout)
+            log.flush()
+            with pathlib.Path(log_path).open("rb") as tail:
+                tail.seek(max(0, tail.seek(0, os.SEEK_END) - 65536))
+                stderr = tail.read().decode("utf-8", errors="replace")
+        completed = subprocess.CompletedProcess(args, process.returncode, stdout or "", stderr or "")
+        if check and completed.returncode != 0:
+            raise subprocess.CalledProcessError(completed.returncode, args, output=completed.stdout, stderr=completed.stderr)
+        return completed
+    except BaseException:
+        if process is not None:
+            _stop_command(process, container)
+        raise
+    finally:
+        if process is not None:
+            with _COMMAND_LOCK:
+                _ACTIVE_COMMANDS.pop(process, None)
+        if log is not None:
+            log.close()
 
-    if log_path is not None:
-        log = pathlib.Path(log_path)
-        log.parent.mkdir(parents=True, exist_ok=True)
-        with open(log, "w", encoding="utf-8") as handle:
-            handle.write("$ " + " ".join(args) + "\n")
-            if completed.stdout:
-                handle.write(completed.stdout)
-                if not completed.stdout.endswith("\n"):
-                    handle.write("\n")
-            if completed.stderr:
-                handle.write("\n[stderr]\n")
-                handle.write(completed.stderr)
-                if not completed.stderr.endswith("\n"):
-                    handle.write("\n")
 
-    if check and completed.returncode != 0:
-        raise subprocess.CalledProcessError(
-            completed.returncode,
-            args,
-            output=completed.stdout,
-            stderr=completed.stderr,
-        )
+def curl_args() -> list[str]:
+    return ["curl", "-fsSL", "--retry", "4", "--retry-delay", "2",
+            "--connect-timeout", "30", "--max-time", "21600"]
 
-    return completed
+
+def fetch_url_text(url: str) -> str:
+    return run_command([*curl_args(), url], check=True).stdout
+
+
+def download_url_to_path(
+    url: str, destination: pathlib.Path,
+    *, validator: Callable[[pathlib.Path], bool] | None = None,
+) -> pathlib.Path:
+    ensure_dir(destination.parent)
+    partial = destination.with_name(destination.name + ".part")
+    # Curl resumes an interrupted transfer; only a successful, validated transfer
+    # becomes the canonical cache file. Interruptions leave .part for the next run.
+    run_command([*curl_args(), "--continue-at", "-", "-o", str(partial), url], check=True)
+    if not partial.is_file() or partial.stat().st_size == 0 or (validator and not validator(partial)):
+        remove_if_exists(partial)
+        raise RuntimeError(f"Downloaded file failed validation: {url}")
+    partial.replace(destination)
+    return destination
+
+
+def completed_vcf(path: pathlib.Path) -> bool:
+    return checkpoint_complete(path.with_name(path.name + ".completed.json"),
+                               [path, pathlib.Path(str(path) + ".tbi")])
+
+
+def record_vcf_checkpoint(path: pathlib.Path) -> None:
+    record_checkpoint(path.with_name(path.name + ".completed.json"),
+                      [path, pathlib.Path(str(path) + ".tbi")])
 
 
 def remove_if_exists(*paths: str | pathlib.Path) -> None:
@@ -245,6 +386,8 @@ def remove_if_exists(*paths: str | pathlib.Path) -> None:
 def atomic_copy(source: str | pathlib.Path, destination: str | pathlib.Path) -> pathlib.Path:
     src = pathlib.Path(source)
     dst = pathlib.Path(destination)
+    if src.resolve() == dst.resolve() or (dst.exists() and src.samefile(dst)):
+        raise ValueError(f"Refusing to overwrite source file while copying: {src}")
     dst.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=str(dst.parent), delete=False) as handle:
         temp_path = pathlib.Path(handle.name)
@@ -274,8 +417,11 @@ def stage_file(
     fingerprint: dict[str, Any] | None = None,
 ) -> str:
     source = pathlib.Path(source_path)
-    destination_dir = ensure_dir(destination_dir)
+    destination_dir = pathlib.Path(destination_dir)
     destination = destination_dir / source.name
+    if source.resolve() == destination.resolve() or (destination.exists() and source.samefile(destination)):
+        raise ValueError(f"Refusing to stage a file over its source: {source}")
+    ensure_dir(destination_dir)
     metadata_path = destination_dir / f"{source.name}.staged.json"
     fingerprint = fingerprint or sample_file_fingerprint(source)
     if destination.exists() and metadata_path.exists():
@@ -286,7 +432,6 @@ def stage_file(
         if metadata.get("source_fingerprint", {}).get("id") == fingerprint["id"]:
             return str(destination)
 
-    remove_if_exists(destination)
     atomic_copy(source, destination)
     write_json(
         metadata_path,
@@ -389,27 +534,29 @@ def docker_mount_path(path: str | pathlib.Path, docker_bin: str) -> str:
 def build_docker_run_command(
     *,
     image: str,
-    mounts: dict[str | pathlib.Path, str],
+    mounts: dict[str | pathlib.Path, str | tuple[str, str]] | list[tuple[str | pathlib.Path, str, str]],
     inner_args: list[str],
     docker_bin: str,
     env: dict[str, str] | None = None,
 ) -> list[str]:
     command = [docker_bin, "run", "--rm", "-u", f"{os.getuid()}:{os.getgid()}"]
-    for host_path, container_path in mounts.items():
-        command.extend(["-v", f"{docker_mount_path(host_path, docker_bin)}:{container_path}"])
+    if isinstance(mounts, dict):
+        entries = [
+            (host, *target) if isinstance(target, tuple) else (host, target, "rw")
+            for host, target in mounts.items()
+        ]
+    else:
+        entries = mounts
+    for host_path, container_path, mode in entries:
+        if mode not in {"ro", "rw"}:
+            raise ValueError(f"Unsupported Docker mount mode: {mode}")
+        command.extend(["-v", f"{docker_mount_path(host_path, docker_bin)}:{container_path}:{mode}"])
     if env:
         for key, value in env.items():
             command.extend(["-e", f"{key}={value}"])
     command.append(image)
     command.extend(inner_args)
     return command
-
-
-def format_java_memory(raw: str) -> str:
-    lowered = raw.lower().replace(" ", "")
-    lowered = lowered.replace(".gb", "g").replace("gb", "g")
-    lowered = lowered.replace(".mb", "m").replace("mb", "m")
-    return lowered
 
 
 def parse_memory_to_mb(raw: str | int | float) -> int:
@@ -545,12 +692,40 @@ def run_tasks_in_parallel(
         return results
 
     results: list[Any] = [None] * len(task_list)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(task): idx for idx, task in enumerate(task_list)}
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    failures: list[BaseException] = []
+    failure_lock = threading.Lock()
+
+    def execute(task: Callable[[], Any]) -> Any:
+        check_cancelled()
+        try:
+            return task()
+        except BaseException as exc:
+            with failure_lock:
+                if not failures and not isinstance(exc, CancelledError):
+                    failures.append(exc)
+                _CANCEL_COMMANDS.set()
+            raise
+
+    future_map = {}
+    try:
+        for idx, task in enumerate(task_list):
+            future_map[executor.submit(execute, task)] = idx
         for future in as_completed(future_map):
             idx = future_map[future]
             result = future.result()
             results[idx] = result
             if on_complete is not None:
                 on_complete(idx, result)
+    except BaseException as exc:
+        for future in future_map:
+            future.cancel()
+        cancel_commands()
+        # A cancelled peer can finish before the shard that caused cancellation.
+        if failures and not isinstance(exc, KeyboardInterrupt):
+            raise failures[0]
+        raise
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+        _CANCEL_COMMANDS.clear()
     return results

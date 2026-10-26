@@ -11,5 +11,3 @@ fasta: /path/to/reference/hg38_alt_masked.fa
 fai: /path/to/reference/hg38_alt_masked.fa.fai
 dict: /path/to/reference/hg38_alt_masked.dict
 expected_contig_prefix: chr
-download:
-  url: null

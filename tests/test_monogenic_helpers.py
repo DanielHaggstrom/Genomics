@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import csv
+import copy
 import gzip
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from workflow.stages.monogenic import (
+    annotate_with_vep,
+    build_gatk_command,
     extract_priority_variants,
     iter_annotated_variants,
+    monogenic_cache_key,
     triage_clinvar,
 )
 
@@ -40,6 +45,46 @@ chr2\t200\trs3\tC\tT\t60\tPASS\tCSQ=T|stop_gained|HIGH|GENE3|ENSG3|c.2C>T|p.Arg2
 
 
 class MonogenicHelperTests(unittest.TestCase):
+    def test_cache_identity_tracks_import_reference_and_analysis_changes(self) -> None:
+        context = {
+            "sample_id": "SYNTHETIC", "input_fingerprint": {"id": "input"},
+            "manifest": {"analysis": {"monogenic": {"mode": "moderate", "max_af": 0.05, "vep_forks": 1}}},
+            "reference_bundle": {"bundle_id": "test", "fingerprint_id": "reference-a"},
+            "reuse": {"called_vcf": {"fingerprint": {"id": "import-a"}}},
+        }
+        key = monogenic_cache_key(context)
+        changed = copy.deepcopy(context)
+        changed["reuse"]["called_vcf"]["fingerprint"]["id"] = "import-b"
+        self.assertNotEqual(key, monogenic_cache_key(changed))
+        changed = copy.deepcopy(context)
+        changed["reference_bundle"]["fingerprint_id"] = "reference-b"
+        self.assertNotEqual(key, monogenic_cache_key(changed))
+        changed = copy.deepcopy(context)
+        changed["manifest"]["analysis"]["monogenic"]["max_af"] = 0.01
+        self.assertNotEqual(key, monogenic_cache_key(changed))
+        self.assertEqual(key, monogenic_cache_key(context))
+
+    def test_gatk_preserves_both_read_only_mounts_when_sources_share_directory(self) -> None:
+        command = build_gatk_command(docker_bin="docker", cram_path=Path("/originals/sample.cram"),
+                                     reference_fasta=Path("/originals/ref.fa"), output_dir=Path("/cache/run"),
+                                     image="test", inner_args=["gatk"])
+        self.assertIn("/originals:/input:ro", command)
+        self.assertIn("/originals:/ref:ro", command)
+        self.assertIn("/cache/run:/out:rw", command)
+
+    def test_annotation_never_indexes_original_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            vcf = tmp / "original.vcf.gz"
+            vcf.write_bytes(b"synthetic original")
+            with patch("workflow.stages.monogenic.run_command") as command:
+                with self.assertRaisesRegex(ValueError, "with its index"):
+                    annotate_with_vep(docker_bin="docker", input_vcf=vcf, output_vcf=tmp / "out.vcf.gz",
+                                      vep_data_root=tmp / "vep", forks=1)
+                command.assert_not_called()
+            self.assertEqual(vcf.read_bytes(), b"synthetic original")
+            self.assertFalse(Path(str(vcf) + ".tbi").exists())
+
     def write_test_vcf(self, path: Path) -> None:
         with gzip.open(path, "wt", encoding="utf-8") as handle:
             handle.write(TEST_VCF)

@@ -4,13 +4,24 @@ import pathlib
 import tempfile
 import unittest
 
-from workflow.core.manifest import apply_defaults, derive_execution_mode, expand_score_preset, validate_manifest_file
+from workflow.core.manifest import apply_defaults, derive_execution_mode, expand_score_preset, resolve_linux_cache_root, validate_manifest_file
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 class ValidateManifestTests(unittest.TestCase):
+    def test_launcher_rejects_cache_in_originals_before_creating_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            originals = root / "originals"
+            originals.mkdir()
+            manifest = root / "sample.yaml"
+            manifest.write_text(f"inputs:\n  cram: {originals}/sample.cram\n  crai: {originals}/sample.cram.crai\nruntime:\n  linux_cache_root: {originals}/cache\n")
+            with self.assertRaisesRegex(ValueError, "protected input"):
+                resolve_linux_cache_root(manifest)
+            self.assertEqual(list(originals.iterdir()), [])
+
     def test_defaults_and_score_preset_expand(self) -> None:
         manifest = {
             "sample_id": "TEST_SAMPLE",
@@ -40,7 +51,6 @@ class ValidateManifestTests(unittest.TestCase):
         self.assertEqual(manifest["runtime"]["linux_cache_root"], "~/.cache/genomics")
         self.assertEqual(manifest["outputs"]["results_dir"], "output/results")
         self.assertEqual(manifest["outputs"]["run_id"], "latest")
-        self.assertFalse(manifest["reference"]["remote_decode_probe"])
         self.assertEqual(manifest["analysis"]["monogenic"]["mode"], "moderate")
         self.assertIsNone(manifest["analysis"]["monogenic"]["workers"])
         self.assertIsNone(manifest["analysis"]["monogenic"]["pairhmm_threads"])

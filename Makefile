@@ -2,6 +2,7 @@ SHELL := /usr/bin/env bash
 
 RUN ?= manifests/examples/sample.yaml
 EXTRA ?=
+PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
 .PHONY: help run status validate validate-manifest test clean clean-cache clean-all
 
@@ -22,26 +23,26 @@ run:
 
 status:
 	@test -n "$(RUN)" || (echo "Set RUN=manifests/<sample>.yaml"; exit 1)
-	@PYTHONPATH=. python3 -m workflow.core.manifest status --manifest "$(RUN)"
+	@PYTHONPATH=. $(PYTHON) -m workflow.core.manifest status --manifest "$(RUN)"
 
 validate:
-	@python3 -m py_compile workflow/core/*.py workflow/stages/*.py workflow/reporting/*.py tests/*.py
+	@$(PYTHON) -m py_compile workflow/*.py workflow/core/*.py workflow/stages/*.py workflow/reporting/*.py tests/*.py
 	@bash -n run.sh
 	@echo "Validation checks passed."
 
 validate-manifest:
 	@test -n "$(RUN)" || (echo "Set RUN=manifests/<sample>.yaml"; exit 1)
-	@PYTHONPATH=. python3 -m workflow.core.manifest validate --manifest "$(RUN)" --schema manifests/schema/run_manifest.schema.json --output /tmp/genomics_manifest.validate.json
+	@PYTHONPATH=. $(PYTHON) -m workflow.core.manifest validate --manifest "$(RUN)" --schema manifests/schema/run_manifest.schema.json --output /tmp/genomics_manifest.validate.json
 	@echo "Manifest is valid."
 
 test:
-	@python3 -m unittest discover -s tests -p "test_*.py"
+	@$(PYTHON) -m unittest discover -s tests -p "test_*.py"
 
 clean:
 	@rm -rf output/results
 
 clean-cache:
-	@CACHE_ROOT="$$(PYTHONPATH=. python3 -m workflow.core.manifest print-project-cache-root --manifest "$(RUN)")" && rm -rf "$$CACHE_ROOT"
+	@CACHE_ROOT="$$(PYTHONPATH=. $(PYTHON) -m workflow.core.manifest print-project-cache-root --manifest "$(RUN)")" && rm -rf "$$CACHE_ROOT"
 
 clean-all: clean clean-cache
 	@find workflow tests -type d -name "__pycache__" -prune -exec rm -rf {} +

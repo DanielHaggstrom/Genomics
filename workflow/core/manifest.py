@@ -6,7 +6,7 @@ import pathlib
 import sys
 from typing import Any
 
-from workflow.core.runtime import REPO_ROOT, hash_strings, load_json, load_yaml, normalize_path, sample_file_fingerprint, validate_payload, write_json
+from workflow.core.runtime import REPO_ROOT, load_json, load_yaml, normalize_path, validate_payload, write_json
 
 
 DEFAULTS = {
@@ -25,7 +25,7 @@ DEFAULTS = {
 }
 
 MONOGENIC_DEFAULTS = {
-    "enabled": True,
+    "enabled": False,
     "mode": "moderate",
     "max_af": 0.05,
     "vep_forks": 8,
@@ -41,6 +41,8 @@ PRS_DEFAULTS = {
     "sample_sex": None,
     "workers": None,
     "pairhmm_threads": None,
+    "min_depth": 10,
+    "min_gq": 20,
     "imputation": {
         "enabled": False,
         "backend": "beagle",
@@ -79,6 +81,8 @@ def load_presets(manifest_path: pathlib.Path | None = None) -> dict[str, list[st
 
 def apply_defaults(manifest: dict[str, Any]) -> dict[str, Any]:
     out = dict(manifest)
+    out["inputs"] = dict(out.get("inputs") or {})
+    out["inputs"].setdefault("protected_roots", [])
 
     for section, defaults in DEFAULTS.items():
         merged = dict(defaults)
@@ -103,8 +107,6 @@ def apply_defaults(manifest: dict[str, Any]) -> dict[str, Any]:
     out["analysis"] = analysis
 
     reference = dict(out.get("reference", {}) or {})
-    reference.setdefault("autodownload", False)
-    reference.setdefault("remote_decode_probe", False)
     out["reference"] = reference
 
     return out
@@ -158,7 +160,15 @@ def resolve_linux_cache_root(manifest_path: pathlib.Path | None = None) -> str:
         raise SystemExit("Manifest must be a YAML object at the top level")
 
     manifest = apply_defaults(raw_manifest)
-    return normalize_path(manifest["runtime"]["linux_cache_root"], base_dir=manifest_path.parent) or str(pathlib.Path.home() / ".cache" / "genomics")
+    cache_root = normalize_path(manifest["runtime"]["linux_cache_root"], base_dir=manifest_path.parent)
+    from workflow.core.reference import validate_work_roots
+    validate_work_roots(
+        runtime_root=cache_root,
+        results_root=normalize_path(manifest["outputs"]["results_dir"], base_dir=REPO_ROOT),
+        input_paths=[normalize_path(manifest["inputs"][key], base_dir=manifest_path.parent) for key in ("cram", "crai")],
+        protected_roots=[normalize_path(path, base_dir=manifest_path.parent) for path in manifest["inputs"].get("protected_roots", [])],
+    )
+    return cache_root
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
@@ -176,12 +186,6 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_print_linux_cache_root(args: argparse.Namespace) -> int:
-    manifest_path = pathlib.Path(args.manifest).resolve()
-    print(resolve_linux_cache_root(manifest_path))
-    return 0
-
-
 def cmd_print_project_cache_root(args: argparse.Namespace) -> int:
     from workflow.core.reference import project_cache_id
 
@@ -196,56 +200,20 @@ def cmd_status(args: argparse.Namespace) -> int:
     import json
 
     manifest_path = pathlib.Path(args.manifest).resolve()
-    schema_path = REPO_ROOT / "manifests" / "schema" / "run_manifest.schema.json"
-    manifest = validate_manifest_file(manifest_path, schema_path)
-
-    linux_cache_root = pathlib.Path(resolve_linux_cache_root(manifest_path))
-    project_cache_root = linux_cache_root / project_cache_id()
-    normalized_cram = pathlib.Path(normalize_path(manifest["inputs"]["cram"], base_dir=manifest_path.parent))
-    normalized_crai = pathlib.Path(normalize_path(manifest["inputs"]["crai"], base_dir=manifest_path.parent))
-
-    payload: dict[str, Any] = {
-        "manifest_path": str(manifest_path),
-        "execution_mode": derive_execution_mode(manifest),
-        "project_cache_root": str(project_cache_root),
-        "paths": {
-            "nextflow_log": str(project_cache_root / "nextflow" / "nextflow.log"),
-        },
-        "inputs": {
-            "cram": str(normalized_cram),
-            "crai": str(normalized_crai),
-            "cram_exists": normalized_cram.exists(),
-            "crai_exists": normalized_crai.exists(),
-        },
-    }
-
-    if normalized_cram.exists() and normalized_crai.exists():
-        def load_status_json(path: pathlib.Path) -> dict[str, Any] | None:
-            if not path.exists():
-                return None
-            try:
-                return load_json(path)
-            except Exception as exc:
-                return {"status": "unreadable", "message": str(exc), "path": str(path)}
-
-        cram_fingerprint = sample_file_fingerprint(normalized_cram)
-        crai_fingerprint = sample_file_fingerprint(normalized_crai)
-        input_fingerprint_id = hash_strings([cram_fingerprint["id"], crai_fingerprint["id"]])
-        sample_cache_root = project_cache_root / "samples" / input_fingerprint_id
-        monogenic_status_path = sample_cache_root / "monogenic" / "stage_manifest.json"
-        prs_status_path = sample_cache_root / "prs" / "stage_status.json"
-        payload["input_fingerprint_id"] = input_fingerprint_id
-        payload["paths"].update(
-            {
-                "monogenic_stage_status": str(monogenic_status_path),
-                "prs_stage_status": str(prs_status_path),
-            }
-        )
-        payload["stage_statuses"] = {
-            "monogenic": load_status_json(monogenic_status_path),
-            "prs": load_status_json(prs_status_path),
-        }
-
+    run_dir = pathlib.Path(resolve_linux_cache_root(manifest_path)) / project_cache_id() / "run"
+    state = run_dir / "status.json"
+    payload = load_json(state) if state.exists() else {"status": "not_started"}
+    payload["status_file"] = str(state)
+    # Read existing stage pointers; status must not fingerprint or scan genomic inputs.
+    context_path = run_dir / "context.json"
+    if payload.get("manifest_path") == str(manifest_path) and context_path.exists():
+        context = load_json(context_path)
+        prs_status = pathlib.Path(context["cache"]["prs_root"]) / "stage_status.json"
+        if payload.get("phase") == "prs" and prs_status.exists():
+            payload["prs"] = load_json(prs_status)
+    elif payload.get("manifest_path") not in (None, str(manifest_path)):
+        payload = {"status": "not_started", "status_file": str(state),
+                   "message": "The cache currently records a different manifest."}
     if args.output:
         write_json(args.output, payload)
     else:
@@ -262,10 +230,6 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--schema", required=True)
     validate_parser.add_argument("--output", required=True)
     validate_parser.set_defaults(func=cmd_validate)
-
-    cache_root_parser = subparsers.add_parser("print-linux-cache-root")
-    cache_root_parser.add_argument("--manifest", required=True)
-    cache_root_parser.set_defaults(func=cmd_print_linux_cache_root)
 
     project_cache_root_parser = subparsers.add_parser("print-project-cache-root")
     project_cache_root_parser.add_argument("--manifest", required=True)

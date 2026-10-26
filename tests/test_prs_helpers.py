@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import gzip
+import json
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 import tempfile
+from unittest.mock import patch
+
+from workflow.core.manifest import apply_defaults
+from workflow.stages import prs
 
 from workflow.stages.prs import (
     base_contig_name,
     beagle_failed_due_to_no_common_markers,
-    beagle_log_has_no_common_markers,
     build_pgsc_calc_resource_config,
     build_pgsc_calc_samplesheet,
     canonical_score_id,
@@ -27,7 +32,6 @@ from workflow.stages.prs import (
     resolve_score_row_alleles,
     resolve_score_row_alleles_for_site,
     safe_sampleset_name,
-    strip_vcf_suffix,
 )
 
 
@@ -40,6 +44,194 @@ class FakeFasta:
 
 
 class PrsHelperTests(unittest.TestCase):
+    def test_scaffold_stage_materializes_reference_and_masks_uncertain_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            originals = root / "originals"
+            originals.mkdir()
+            cram, reference = originals / "sample.cram", originals / "ref.fa"
+            cram.write_bytes(b"synthetic alignment")
+            reference.write_bytes(b">chr1\nACGT\n")
+            before = {path: path.read_bytes() for path in (cram, reference)}
+            header = "##fileformat=VCFv4.2\n##contig=<ID=chr1,length=100>\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"
+            targets = root / "targets.vcf.gz"
+            with gzip.open(targets, "wt") as handle:
+                handle.write(header + "\nchr1\t10\t.\tA\tG\t.\t.\t.\nchr1\t20\t.\tC\tT\t.\t.\t.\n")
+            calls = header + "\tFORMAT\tNEBULA_SAMPLE\nchr1\t10\t.\tA\t.\t.\t.\t.\tGT:DP:RGQ\t0/0:25:60\nchr1\t20\t.\tC\tT\t.\t.\t.\tGT:DP:GQ\t0/1:25:5\n"
+
+            def fake_command(args, **kwargs):
+                if args[0] == "docker":
+                    mounts = {args[i + 1].split(":")[1]: Path(args[i + 1].split(":")[0]) for i, token in enumerate(args) if token == "-v"}
+                    output = Path(args[args.index("-O") + 1])
+                    destination = mounts["/" + output.parts[1]] / output.name
+                    if "GenotypeGVCFs" in args:
+                        self.assertIn("--include-non-variant-sites", args)
+                        with gzip.open(destination, "wt") as handle:
+                            handle.write(calls)
+                    else:
+                        destination.write_bytes(b"synthetic intermediate")
+                    Path(str(destination) + ".tbi").write_bytes(b"synthetic index")
+                elif args[:2] == ["tabix", "-f"]:
+                    Path(args[-1] + ".tbi").write_bytes(b"synthetic index")
+                elif args[:2] == ["bcftools", "sort"]:
+                    with gzip.open(args[args.index("-o") + 1], "wt") as handle:
+                        handle.write(Path(args[-1]).read_text())
+                else:
+                    Path(args[args.index("-o") + 1]).write_bytes(Path(args[-1]).read_bytes())
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            kwargs = dict(docker_bin="docker", stage_root=root / "cache", cram_path=cram,
+                          reference_fasta=reference, shard={"name": "chr1", "intervals": ["chr1"]},
+                          targets_vcf=targets, sample_id="TEST", pairhmm_threads=1, java_memory="1g")
+            with patch.object(prs, "run_command", side_effect=fake_command) as runner:
+                result = prs.build_dense_prs_shard(**kwargs)
+                count = runner.call_count
+                self.assertTrue(prs.build_dense_prs_shard(**kwargs)["reused"])
+                self.assertEqual(runner.call_count, count)
+            with gzip.open(result["dense_vcf"], "rt") as handle:
+                rows = [line.split("\t") for line in handle if not line.startswith("#")]
+            self.assertEqual(rows[0][3:5], ["A", "G"])
+            self.assertTrue(rows[0][9].startswith("0/0:"))
+            self.assertTrue(rows[1][9].startswith("./.:"))
+            self.assertEqual(result["genotype_qc"]["callable_sites"], 1)
+            self.assertEqual(result["genotype_qc"]["missing_sites"], 1)
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_conversion_cache_tracks_actual_input_kind_dosage_and_sex(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "original.vcf.gz"
+            source.write_bytes(b"original-sequence-data")
+            context = {"sample_id": "TEST", "host_checks": {"docker": "docker"},
+                       "manifest": apply_defaults({"analysis": {"prs": {"pgs_ids": ["PGS999001"]}}})}
+            commands = []
+
+            def fake_command(args, **kwargs):
+                commands.append(args)
+                if args[:3] == ["bcftools", "query", "-l"]:
+                    return subprocess.CompletedProcess(args, 0, "NEBULA_SAMPLE\n", "")
+                if args[0] == "docker":
+                    mount = next(args[i + 1] for i, item in enumerate(args) if item == "-v")
+                    work = Path(mount.rsplit(":", 2)[0])
+                    prefix = Path(args[args.index("--out") + 1]).name
+                    for suffix in (".pgen", ".pvar.zst", ".psam"):
+                        (work / (prefix + suffix)).write_bytes(b"generated")
+                elif "-o" in args:
+                    Path(args[args.index("-o") + 1]).write_bytes(b"generated-vcf")
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            with patch.object(prs, "ensure_docker_ready"), patch.object(prs, "run_command", side_effect=fake_command):
+                first = prs.build_pgsc_input_pfile(context=context, stage_root=root / "cache", input_vcf=source, input_kind="dense_vcf")
+                count = len(commands)
+                repeated = prs.build_pgsc_input_pfile(context=context, stage_root=root / "cache", input_vcf=source, input_kind="dense_vcf")
+                self.assertTrue(repeated["reused"])
+                self.assertEqual(len(commands), count)
+                imputed = prs.build_pgsc_input_pfile(context=context, stage_root=root / "cache", input_vcf=source, input_kind="imputed_vcf", dosage_field="DS")
+                self.assertNotEqual(first["path_prefix"], imputed["path_prefix"])
+                self.assertTrue(any('FMT/DS!="."' in command for command in commands))
+                context["manifest"]["analysis"]["prs"]["sample_sex"] = "female"
+                changed_sex = prs.build_pgsc_input_pfile(context=context, stage_root=root / "cache", input_vcf=source, input_kind="imputed_vcf", dosage_field="DS")
+                self.assertNotEqual(imputed["path_prefix"], changed_sex["path_prefix"])
+                source.write_bytes(b"different-genotype-data")
+                changed_source = prs.build_pgsc_input_pfile(context=context, stage_root=root / "cache", input_vcf=source, input_kind="imputed_vcf", dosage_field="DS")
+                self.assertNotEqual(changed_sex["path_prefix"], changed_source["path_prefix"])
+                # Rebuilds touch generated cache only, never their input.
+                self.assertEqual(source.read_bytes(), b"different-genotype-data")
+
+    def test_imputation_threshold_and_panel_data_get_separate_cache_trees(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dense, reference, panel_vcf = (root / name for name in ("dense.vcf.gz", "ref.fa", "panel.vcf.gz"))
+            for path in (dense, reference, panel_vcf):
+                path.write_bytes(b"fixture")
+            context = {"input_fingerprint": {"id": "sample"},
+                       "manifest": apply_defaults({"analysis": {"prs": {"pgs_ids": ["PGS999001"]}}})}
+            panel = {"panel_id": "panel", "manifest_path": "/fixture/panel.yaml", "manifest_fingerprint_id": "manifest"}
+            shards = [{"panel_resource": {"vcf": panel_vcf}}]
+            with patch.object(prs, "load_imputation_panel", return_value=panel), patch.object(prs, "build_imputation_shards", return_value=shards), patch.object(prs, "load_existing_imputation_stage", side_effect=lambda path, key: {"cache_key": key}) as lookup:
+                kwargs = dict(context=context, stage_root=root / "cache", dense_info={"artifacts": {"dense_vcf": str(dense)}}, score_hash="scores", reference_fasta=reference)
+                prs.build_or_reuse_imputed_vcf(**kwargs)
+                first = lookup.call_args.args[0]
+                context["manifest"]["analysis"]["prs"]["imputation"]["info_threshold"] = 0.9
+                prs.build_or_reuse_imputed_vcf(**kwargs)
+                second = lookup.call_args.args[0]
+                self.assertNotEqual(first, second)
+                panel_vcf.write_bytes(b"changed-panel-data")
+                prs.build_or_reuse_imputed_vcf(**kwargs)
+                self.assertNotEqual(second, lookup.call_args.args[0])
+
+    def test_beagle_error_executes_real_passthrough_handler(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shard = {"name": "chr1", "intervals": ["chr1"], "imputation_mode": "impute", "panel_resource": {"panel_chrom": "chr1"}}
+            error = subprocess.CalledProcessError(1, ["java"], stderr="no markers in common")
+            with patch.object(prs, "extract_dense_contig_vcf", return_value=root / "target.vcf.gz"), patch.object(prs, "rename_contig_for_panel", return_value=root / "target.vcf.gz"), patch.object(prs, "target_has_imputable_markers", return_value=True), patch.object(prs, "stage_panel_resources", return_value={"panel_vcf": root / "panel.vcf.gz", "map": None}), patch.object(prs, "run_command", side_effect=error), patch.object(prs, "build_dense_passthrough_shard", return_value=(root / "passthrough.vcf.gz", False)):
+                result = prs.build_imputed_prs_shard(context={"sample_id": "TEST", "runtime": {"linux_cache_root": str(root)}}, stage_root=root, dense_vcf=root / "dense.vcf.gz", reference_fasta=root / "ref.fa", shard=shard, panel={}, beagle_jar=root / "beagle.jar", java_memory="1g", beagle_threads=1, info_threshold=0.8)
+            self.assertEqual(result["mode"], "passthrough")
+            self.assertEqual(result["passthrough_reason"], "no_panel_overlap_window")
+
+    def test_imported_scaffold_reaches_requested_imputation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dense, imputed, log = (root / name for name in ("dense.vcf.gz", "imputed.vcf.gz", "pgsc.log"))
+            dense.write_bytes(b"direct")
+            imputed.write_bytes(b"imputed")
+            log.write_text("fixture failure after input selection\n")
+            manifest = apply_defaults({"analysis": {"monogenic": {"enabled": False}, "prs": {"pgs_ids": ["PGS999001"], "imputation": {"enabled": True}}}})
+            context = {"sample_id": "TEST", "input_fingerprint": {"id": "sample"}, "manifest": manifest,
+                       "cache": {"prs_root": str(root / "cache")}, "reference_bundle": {"status": "ready", "fasta": str(root / "ref.fa")},
+                       "reuse": {"prs_dense_vcf": {"active": str(dense), "original": str(dense), "fingerprint": {"id": "import"}, "sidecars": {"index": str(dense) + ".tbi"}, "provenance": "external", "trusted_provenance": False}}}
+            path = root / "context.json"
+            path.write_text(json.dumps(context))
+            payload = {"cache_key": "imputed", "artifacts": {"imputed_vcf": str(imputed), "imputed_vcf_index": str(imputed) + ".tbi"}}
+            pfile_info = {"artifacts": {}, "renamed_chr_prefix": None}
+            with patch.object(sys, "argv", ["prs", "--context", str(path), "--output", str(root / "stage.json")]), patch.object(prs, "build_or_reuse_imputed_vcf", return_value=(payload, {"phase": "imputed"})) as impute, patch.object(prs, "run_pgsc_calc", return_value=(1, log, pfile_info)) as score:
+                prs.main()
+            self.assertEqual(impute.call_count, 1)
+            self.assertEqual(score.call_args.kwargs["scoring_vcf"], imputed)
+            self.assertEqual(score.call_args.kwargs["dosage_field"], "DS")
+
+    def test_scoring_resume_keeps_existing_work_and_pins_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "work").mkdir()
+            sentinel = root / "work" / "completed-task"
+            sentinel.write_bytes(b"keep resumable work")
+            manifest = apply_defaults({"analysis": {"prs": {"pgs_ids": ["PGS999001"]}}})
+            context = {"sample_id": "TEST", "manifest": manifest, "runtime": {"nextflow_home": str(root / "home")}}
+            info = {"path_prefix": str(root / "input"), "format": "pfile"}
+            with patch.object(prs, "build_pgsc_input_pfile", return_value=info), \
+                 patch.object(prs.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")), \
+                 patch.object(prs, "run_command", return_value=subprocess.CompletedProcess([], 0, "", "")) as command:
+                prs.run_pgsc_calc(context=context, stage_root=root, scoring_vcf=root / "fixture.vcf.gz", input_kind="dense_vcf")
+            args = command.call_args.args[0]
+            self.assertEqual(args[args.index("-r") + 1], prs.PGSC_CALC_REVISION)
+            self.assertIn("-resume", args)
+            self.assertEqual(command.call_args.kwargs["cwd"], root)
+            self.assertEqual(sentinel.read_bytes(), b"keep resumable work")
+            config = (root / "pgsc_calc.resources.config").read_text()
+            self.assertIn("executor {", config)
+            self.assertIn("cpus = 8", config)
+            self.assertIn("--label genomics.scoring=", config)
+
+    def test_scoring_interrupt_removes_only_its_labeled_containers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context = {"sample_id": "TEST", "host_checks": {"docker": "docker"},
+                       "manifest": apply_defaults({"analysis": {"prs": {"pgs_ids": ["PGS999001"]}}}),
+                       "runtime": {"nextflow_home": str(root / "home")}}
+            info = {"path_prefix": str(root / "input"), "format": "pfile"}
+            with patch.object(prs, "build_pgsc_input_pfile", return_value=info), \
+                 patch.object(prs, "run_command", side_effect=KeyboardInterrupt), \
+                 patch.object(prs.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 0, "owned-container\n", ""),
+                                                                 subprocess.CompletedProcess([], 0, "", "")]) as cleanup:
+                with self.assertRaises(KeyboardInterrupt):
+                    prs.run_pgsc_calc(context=context, stage_root=root, scoring_vcf=root / "fixture.vcf.gz", input_kind="dense_vcf")
+            query, removal = [call.args[0] for call in cleanup.call_args_list]
+            self.assertEqual(query[:4], ["docker", "ps", "-aq", "--filter"])
+            self.assertTrue(query[4].startswith("label=genomics.scoring="))
+            self.assertEqual(removal, ["docker", "rm", "-f", "owned-container"])
+
     def test_canonical_score_id_strips_harmonized_suffix(self) -> None:
         self.assertEqual(canonical_score_id("PGS999001_hmPOS_GRCh38"), "PGS999001")
         self.assertEqual(canonical_score_id("PGS999001_hmPOS_GRCh37"), "PGS999001")
@@ -59,10 +251,6 @@ class PrsHelperTests(unittest.TestCase):
         self.assertEqual(safe_sampleset_name("DEMO_SAMPLE_001"), "DEMO-SAMPLE-001")
         self.assertEqual(safe_sampleset_name("bad_name with spaces"), "bad-name-with-spaces")
         self.assertEqual(safe_sampleset_name("reference"), "sample")
-
-    def test_strip_vcf_suffix_handles_bgz_and_vcf(self) -> None:
-        self.assertEqual(strip_vcf_suffix(Path("/tmp/input.vcf.gz")), Path("/tmp/input"))
-        self.assertEqual(strip_vcf_suffix(Path("/tmp/input.vcf")), Path("/tmp/input"))
 
     def test_parse_overlap_diagnostics(self) -> None:
         log = """
@@ -128,15 +316,6 @@ class PrsHelperTests(unittest.TestCase):
         )
         self.assertFalse(beagle_failed_due_to_no_common_markers(error))
 
-    def test_beagle_log_has_no_common_markers(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            log = Path(tmpdir) / "chrX.beagle.log"
-            log.write_text(
-                "java.lang.IllegalArgumentException: The reference and target VCF files contain no markers in common in the window:\n",
-                encoding="utf-8",
-            )
-            self.assertTrue(beagle_log_has_no_common_markers(log))
-
     def test_parse_base_tokens_accepts_single_base_tokens_only(self) -> None:
         self.assertEqual(parse_base_tokens("G/T"), {"G", "T"})
         self.assertEqual(parse_base_tokens(" C / G / T "), {"C", "G", "T"})
@@ -198,7 +377,7 @@ class PrsHelperTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            self.assertFalse(target_has_imputable_markers(target_vcf=vcf, shard_dir=root, shard_name="chrX"))
+            self.assertFalse(target_has_imputable_markers(vcf))
 
     def test_target_has_imputable_markers_accepts_variant_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -217,7 +396,7 @@ class PrsHelperTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            self.assertTrue(target_has_imputable_markers(target_vcf=vcf, shard_dir=root, shard_name="chr5"))
+            self.assertTrue(target_has_imputable_markers(vcf))
 
     def test_resolve_score_row_alleles_prefers_explicit_other_allele(self) -> None:
         resolved, reason = resolve_score_row_alleles(

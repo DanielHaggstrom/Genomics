@@ -2,16 +2,17 @@
 from __future__ import annotations
 
 import argparse
-import gzip
 import pathlib
 import re
 import shutil
 import sys
-import urllib.request
-from typing import Any
+from typing import Any, Iterable
 
 from workflow.core.runtime import (
     REPO_ROOT,
+    artifacts_exist,
+    checkpoint_complete,
+    record_checkpoint,
     detect_executable,
     ensure_dir,
     hash_strings,
@@ -215,52 +216,29 @@ def resolve_bundle_manifest(reference_cfg: dict[str, Any]) -> pathlib.Path | Non
     return None
 
 
-def maybe_download_bundle(bundle: dict[str, Any], bundle_cache_dir: pathlib.Path) -> dict[str, Any]:
-    download_cfg = bundle.get("download") or {}
-    url = download_cfg.get("url")
-    if not url:
-        return bundle
-
-    fasta = pathlib.Path(bundle["fasta"]) if bundle.get("fasta") else None
-    if fasta and fasta.exists():
-        return bundle
-
-    bundle_cache_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = bundle_cache_dir / pathlib.Path(url).name
-    urllib.request.urlretrieve(url, archive_path)
-
-    if archive_path.suffix == ".gz" and archive_path.name.endswith(".fa.gz"):
-        fasta_path = bundle_cache_dir / archive_path.stem
-        with gzip.open(archive_path, "rb") as src, open(fasta_path, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-        bundle["fasta"] = str(fasta_path)
-    else:
-        bundle["fasta"] = str(archive_path)
-
-    fasta = pathlib.Path(bundle["fasta"])
-    bundle.setdefault("fai", str(fasta.parent / f"{fasta.name}.fai"))
-    bundle.setdefault("dict", str(fasta.with_suffix(".dict")))
-    return bundle
-
-
-def ensure_bundle_files(bundle: dict[str, Any]) -> tuple[pathlib.Path | None, pathlib.Path | None, pathlib.Path | None, list[str]]:
+def ensure_bundle_files(
+    bundle: dict[str, Any], *, cache_dir: pathlib.Path | None = None,
+) -> tuple[pathlib.Path | None, pathlib.Path | None, pathlib.Path | None, list[str]]:
     fasta = pathlib.Path(bundle["fasta"]) if bundle.get("fasta") else None
     fai = pathlib.Path(bundle["fai"]) if bundle.get("fai") else (pathlib.Path(str(fasta) + ".fai") if fasta else None)
     seq_dict = pathlib.Path(bundle["dict"]) if bundle.get("dict") else (fasta.with_suffix(".dict") if fasta else None)
 
-    missing: list[str] = []
-    if fasta is None or not fasta.exists():
-        missing.append("fasta")
-    if fai is None or not fai.exists():
-        if fasta and fasta.exists():
+    if artifacts_exist([fasta]) and not artifacts_exist([fai, seq_dict]) and cache_dir is not None:
+        # Index only a generated cache copy; never write beside a supplied reference.
+        fingerprint = sample_file_fingerprint(fasta)
+        fasta = pathlib.Path(stage_file(fasta, cache_dir / fingerprint["id"][:16], fingerprint=fingerprint))
+        fai = pathlib.Path(str(fasta) + ".fai")
+        seq_dict = fasta.with_suffix(".dict")
+        fai_receipt = pathlib.Path(str(fai) + ".completed.json")
+        dict_receipt = pathlib.Path(str(seq_dict) + ".completed.json")
+        if not checkpoint_complete(fai_receipt, [fai]):
             run_command(["samtools", "faidx", str(fasta)], check=True)
-        if fai is not None and not fai.exists():
-            missing.append("fai")
-    if seq_dict is None or not seq_dict.exists():
-        if fasta and fasta.exists():
+            record_checkpoint(fai_receipt, [fai])
+        if not checkpoint_complete(dict_receipt, [seq_dict]):
             run_command(["samtools", "dict", "-o", str(seq_dict), str(fasta)], check=True)
-        if seq_dict is not None and not seq_dict.exists():
-            missing.append("dict")
+            record_checkpoint(dict_receipt, [seq_dict])
+
+    missing = [name for name, path in (("fasta", fasta), ("fai", fai), ("dict", seq_dict)) if not artifacts_exist([path])]
     return fasta, fai, seq_dict, missing
 
 
@@ -276,65 +254,13 @@ def infer_reuse_requirements(manifest: dict[str, Any]) -> dict[str, Any]:
     monogenic_enabled = manifest["analysis"]["monogenic"]["enabled"]
     prs_enabled = manifest["analysis"]["prs"]["enabled"]
     monogenic_reference_required = bool(monogenic_enabled and not (reuse.get("annotated_vcf") or reuse.get("called_vcf")))
-    prs_reference_required = bool(prs_enabled and not (reuse.get("prs_dense_vcf") or reuse.get("imputed_prs_vcf")))
+    impute_dense = bool((manifest["analysis"]["prs"].get("imputation") or {}).get("enabled") and reuse.get("prs_dense_vcf"))
+    prs_reference_required = bool(prs_enabled and not reuse.get("imputed_prs_vcf") and
+                                  (not reuse.get("prs_dense_vcf") or impute_dense))
     return {
         "monogenic_reference_required": monogenic_reference_required,
         "prs_reference_required": prs_reference_required,
         "any_reference_required": monogenic_reference_required or prs_reference_required,
-    }
-
-
-def detect_upstream_sample_name(cram_path: str) -> str | None:
-    completed = run_command(["samtools", "view", "-H", cram_path], check=True)
-    for line in completed.stdout.splitlines():
-        if not line.startswith("@RG"):
-            continue
-        match = re.search(r"\bSM:([^\t]+)", line)
-        if match:
-            return match.group(1)
-    return None
-
-
-def run_remote_decode_probe(cram_path: str, first_contig: str, cache_root: pathlib.Path, repo_root: pathlib.Path) -> dict[str, Any]:
-    ensure_dir(cache_root)
-    region = f"{first_contig}:1-1000"
-    env = {
-        "REF_CACHE": str(cache_root / "%2s" / "%2s" / "%s"),
-        "REF_PATH": f"{cache_root}/%2s/%2s/%s:https://www.ebi.ac.uk/ena/cram/md5/%s",
-    }
-    try:
-        completed = run_command(
-            ["samtools", "view", cram_path, region],
-            cwd=repo_root,
-            env=env,
-            check=False,
-            timeout=120,
-        )
-    except Exception as exc:
-        return {
-            "attempted": True,
-            "status": "failed",
-            "region": region,
-            "cache_dir": str(cache_root),
-            "message": f"Remote MD5 decode probe crashed: {exc}",
-        }
-
-    if completed.returncode == 0:
-        return {
-            "attempted": True,
-            "status": "ok",
-            "region": region,
-            "cache_dir": str(cache_root),
-            "message": "samtools successfully decoded CRAM slices via REF_PATH/ENA MD5 resolution.",
-        }
-    return {
-        "attempted": True,
-        "status": "failed",
-        "region": region,
-        "cache_dir": str(cache_root),
-        "message": "samtools could not decode CRAM slices via REF_PATH/ENA MD5 resolution.",
-        "exit_code": completed.returncode,
-        "stderr_tail": (completed.stderr or "").splitlines()[-10:],
     }
 
 
@@ -363,20 +289,28 @@ def prepare_import_artifact(
         raise SystemExit(f"Configured reuse artifact not found: {normalized}")
     fingerprint = sample_file_fingerprint(normalized)
 
-    active, staged = stage_maybe(normalized, staging_root / label, linux_cache_root)
+    import_dir = staging_root / label / fingerprint["id"][:16]
+    source_index = pathlib.Path(f"{normalized}.tbi")
+    needs_index = normalized.name.endswith(".vcf.gz") and not artifacts_exist([source_index])
+    if needs_index:
+        active = stage_file(normalized, import_dir, fingerprint=fingerprint)
+        staged = True
+    else:
+        active, staged = stage_maybe(normalized, import_dir, linux_cache_root)
     active_path = pathlib.Path(active)
     sidecars: dict[str, str] = {}
     if active_path.name.endswith(".vcf.gz"):
         index_path = active_path.parent / f"{active_path.name}.tbi"
-        source_index = pathlib.Path(f"{normalized}.tbi")
-        if staged and source_index.exists() and not index_path.exists():
-            stage_maybe(source_index, staging_root / label, linux_cache_root)
-        if index_path.exists():
+        if staged and artifacts_exist([source_index]):
+            stage_file(source_index, import_dir)
+        index_receipt = import_dir / "index.completed.json"
+        if artifacts_exist([source_index]) or checkpoint_complete(index_receipt, [index_path]):
             sidecars["index"] = str(index_path)
-        elif source_index.exists() and not staged:
-            sidecars["index"] = str(source_index)
         else:
+            if not staged:
+                raise ValueError(f"Refusing to index original import: {normalized}")
             run_command(["tabix", "-f", "-p", "vcf", str(active_path)], check=True)
+            record_checkpoint(index_receipt, [index_path])
             sidecars["index"] = str(index_path)
 
     stage_manifest = locate_stage_manifest_for_import(normalized)
@@ -402,9 +336,33 @@ def prepare_import_artifact(
     }
 
 
-def detect_required_executables() -> dict[str, str | None]:
-    names = ["docker", "java", "nextflow", "python3", "bcftools", "samtools", "tabix"]
+def detect_required_executables(manifest: dict[str, Any]) -> dict[str, str | None]:
+    names = ["docker", "bcftools", "samtools", "tabix"]
+    prs = manifest["analysis"]["prs"]
+    if prs["enabled"]:
+        names.extend(["java", "nextflow", "curl"])
+        reuse = manifest.get("reuse") or {}
+        if prs.get("run_ancestry") or not (reuse.get("prs_dense_vcf") or reuse.get("imputed_prs_vcf")):
+            names.extend(["tar", "zstd"])
+    if manifest["analysis"]["monogenic"]["enabled"] and not (manifest.get("reuse") or {}).get("annotated_vcf"):
+        names.extend(["curl", "tar"])
     return {name: detect_executable(name) for name in names}
+
+
+def validate_work_roots(
+    *, runtime_root: str | pathlib.Path, results_root: str | pathlib.Path,
+    input_paths: Iterable[str | pathlib.Path], protected_roots: Iterable[str | pathlib.Path] = (),
+) -> None:
+    """Reject write trees that overlap raw-data directories, including symlink aliases."""
+    protected = {pathlib.Path(path).resolve() for path in protected_roots}
+    for path in input_paths:
+        source = pathlib.Path(path)
+        protected.update((source.absolute().parent, source.resolve().parent))
+    for label, raw_root in (("runtime cache", runtime_root), ("results", results_root)):
+        root = pathlib.Path(raw_root).resolve()
+        for source_root in protected:
+            if root == source_root or root in source_root.parents or source_root in root.parents:
+                raise ValueError(f"Unsafe {label} directory {root}: overlaps protected input directory {source_root}")
 
 
 def cmd_prepare_context(args: argparse.Namespace) -> int:
@@ -414,25 +372,50 @@ def cmd_prepare_context(args: argparse.Namespace) -> int:
     execution_mode = validated.get("execution_mode") or "both"
 
     linux_cache_root = pathlib.Path(normalize_path(manifest["runtime"]["linux_cache_root"], base_dir=manifest_path.parent))
-    project_cache_root = ensure_dir(linux_cache_root / project_cache_id())
-    staging_root = ensure_dir(project_cache_root / "staging")
-    nextflow_root = ensure_dir(project_cache_root / "nextflow")
-    tool_cache_root = ensure_dir(project_cache_root / "tool_cache")
-
     results_root = pathlib.Path(normalize_path(manifest["outputs"]["results_dir"], base_dir=REPO_ROOT))
-    results_run_dir = ensure_dir(results_root / manifest["sample_id"] / manifest["outputs"]["run_id"])
-    report_dir = ensure_dir(results_run_dir / "report")
-    manifests_dir = ensure_dir(results_run_dir / "manifests")
-    monogenic_results_dir = ensure_dir(results_run_dir / "monogenic")
-    prs_results_dir = ensure_dir(results_run_dir / "prs")
-
     normalized_inputs = {
-        "cram": pathlib.Path(normalize_path(manifest["inputs"]["cram"], base_dir=manifest_path.parent)),
-        "crai": pathlib.Path(normalize_path(manifest["inputs"]["crai"], base_dir=manifest_path.parent)),
+        key: pathlib.Path(normalize_path(manifest["inputs"][key], base_dir=manifest_path.parent))
+        for key in ("cram", "crai")
     }
+    protected_roots = [
+        pathlib.Path(normalize_path(path, base_dir=manifest_path.parent))
+        for path in manifest["inputs"].get("protected_roots", [])
+    ]
+    validate_work_roots(runtime_root=linux_cache_root, results_root=results_root,
+                        input_paths=normalized_inputs.values(), protected_roots=protected_roots)
+    validate_work_roots(runtime_root=linux_cache_root, results_root=pathlib.Path(args.output).resolve().parent,
+                        input_paths=normalized_inputs.values(), protected_roots=protected_roots)
+    def prepare_dir(path: pathlib.Path) -> pathlib.Path:
+        validate_work_roots(runtime_root=path, results_root=path,
+                            input_paths=normalized_inputs.values(), protected_roots=protected_roots)
+        return ensure_dir(path)
+
+    project_cache_root = prepare_dir(linux_cache_root / project_cache_id())
+    staging_root = prepare_dir(project_cache_root / "staging")
+    nextflow_root = prepare_dir(project_cache_root / "nextflow")
+    tool_cache_root = prepare_dir(project_cache_root / "tool_cache")
+
+    results_run_dir = prepare_dir(results_root / manifest["sample_id"] / manifest["outputs"]["run_id"])
+    report_dir = prepare_dir(results_run_dir / "report")
+    monogenic_results_dir = prepare_dir(results_run_dir / "monogenic")
+    prs_results_dir = prepare_dir(results_run_dir / "prs")
+
     for label, path in normalized_inputs.items():
         if not path.exists():
             raise SystemExit(f"Missing {label.upper()}: {path}")
+
+    executable_checks = detect_required_executables(manifest)
+    missing = [name for name, value in executable_checks.items() if value is None]
+    if missing:
+        raise SystemExit("Missing required executables: " + ", ".join(sorted(missing)))
+
+    disk_usage = shutil.disk_usage(project_cache_root)
+    free_gb = disk_usage.free / (1024 ** 3)
+    min_free_gb = manifest["runtime"]["min_free_gb"]
+    if free_gb < min_free_gb:
+        raise SystemExit(
+            f"Only {free_gb:.1f} GiB free on {project_cache_root}, but manifest requires at least {min_free_gb} GiB"
+        )
 
     cram_fingerprint = sample_file_fingerprint(normalized_inputs["cram"])
     crai_fingerprint = sample_file_fingerprint(normalized_inputs["crai"])
@@ -441,9 +424,9 @@ def cmd_prepare_context(args: argparse.Namespace) -> int:
         "cram": cram_fingerprint,
         "crai": crai_fingerprint,
     }
-    sample_cache_root = ensure_dir(project_cache_root / "samples" / input_fingerprint["id"])
-    monogenic_cache_root = ensure_dir(sample_cache_root / "monogenic")
-    prs_cache_root = ensure_dir(sample_cache_root / "prs")
+    sample_cache_root = prepare_dir(project_cache_root / "samples" / input_fingerprint["id"])
+    monogenic_cache_root = prepare_dir(sample_cache_root / "monogenic")
+    prs_cache_root = prepare_dir(sample_cache_root / "prs")
 
     staged_cram, staged_cram_flag = stage_maybe(
         normalized_inputs["cram"],
@@ -469,41 +452,17 @@ def cmd_prepare_context(args: argparse.Namespace) -> int:
         for key in ("called_vcf", "annotated_vcf", "prs_dense_vcf", "imputed_prs_vcf")
     }
 
-    executable_checks = detect_required_executables()
-    missing = [name for name, value in executable_checks.items() if value is None]
-    if missing:
-        raise SystemExit("Missing required executables: " + ", ".join(sorted(missing)))
-
-    disk_usage = shutil.disk_usage(project_cache_root)
-    free_gb = disk_usage.free / (1024 ** 3)
-    min_free_gb = manifest["runtime"]["min_free_gb"]
-    if free_gb < min_free_gb:
-        raise SystemExit(
-            f"Only {free_gb:.1f} GiB free on {project_cache_root}, but manifest requires at least {min_free_gb} GiB"
-        )
-
     header_completed = run_command(["samtools", "view", "-H", staged_cram], check=True)
     header_text = header_completed.stdout
     sq_entries = parse_sq_entries(header_text)
     pg_entries = parse_program_entries(header_text)
     rg_entries = parse_read_group_entries(header_text)
+    if len({entry["sample"] for entry in rg_entries if entry.get("sample")}) > 1:
+        raise ValueError("CRAM contains multiple sample names; only one sample is supported")
     contig_summary = summarize_contigs(sq_entries)
     provenance_hints = extract_reference_hints(pg_entries)
     contig_names = [entry["name"] for entry in sq_entries if entry.get("name")]
     shards = plan_contig_shards(contig_names, contig_summary["contig_prefix"])
-
-    remote_probe = {
-        "attempted": False,
-        "status": "not_attempted",
-        "message": "Remote MD5 decode probe disabled in manifest.",
-    }
-    if manifest["reference"].get("remote_decode_probe") and contig_summary["first_contigs"]:
-        remote_probe = run_remote_decode_probe(
-            staged_cram,
-            contig_summary["first_contigs"][0],
-            project_cache_root / "references" / "remote_md5_cache",
-            REPO_ROOT,
-        )
 
     stage_requirements = infer_reuse_requirements(manifest)
     reference_cfg = manifest["reference"]
@@ -519,18 +478,17 @@ def cmd_prepare_context(args: argparse.Namespace) -> int:
             required=stage_requirements["any_reference_required"],
             bundle_id=bundle_id,
             message=f"No bundle manifest found for reference bundle_id={bundle_id}",
-            remote_decode_probe=remote_probe,
         )
     else:
         bundle = load_yaml(bundle_manifest_path) or {}
         for key in ("fasta", "fai", "dict"):
             if bundle.get(key):
                 bundle[key] = normalize_path(bundle[key], base_dir=bundle_manifest_path.parent)
-        if reference_cfg.get("autodownload"):
-            bundle = maybe_download_bundle(bundle, project_cache_root / "references" / bundle_id)
 
         try:
-            fasta, fai, seq_dict, missing_bundle_files = ensure_bundle_files(bundle)
+            fasta, fai, seq_dict, missing_bundle_files = ensure_bundle_files(
+                bundle, cache_dir=prepare_dir(project_cache_root / "references" / bundle_id / "prepared"),
+            )
         except Exception as exc:
             fasta = fai = seq_dict = None
             missing_bundle_files = ["prepare_failed"]
@@ -547,10 +505,9 @@ def cmd_prepare_context(args: argparse.Namespace) -> int:
                 bundle_id=bundle_id,
                 bundle_manifest=str(bundle_manifest_path),
                 message=prepare_error or f"Reference bundle is missing required files: {', '.join(missing_bundle_files)}",
-                remote_decode_probe=remote_probe,
             )
         else:
-            reference_stage_root = ensure_dir(project_cache_root / "references" / bundle_id)
+            reference_stage_root = prepare_dir(project_cache_root / "references" / bundle_id)
             staged_fasta, fasta_staged = stage_maybe(fasta, reference_stage_root, linux_cache_root)
             staged_fai, fai_staged = stage_maybe(fai, reference_stage_root, linux_cache_root)
             staged_dict, dict_staged = stage_maybe(seq_dict, reference_stage_root, linux_cache_root)
@@ -568,13 +525,13 @@ def cmd_prepare_context(args: argparse.Namespace) -> int:
                 fasta=staged_fasta,
                 fai=staged_fai,
                 dict=staged_dict,
+                fingerprint_id=hash_strings([sample_file_fingerprint(path)["id"] for path in (staged_fasta, staged_fai, staged_dict)]),
                 staged={"fasta": fasta_staged, "fai": fai_staged, "dict": dict_staged},
                 expected_contig_prefix=expected_prefix,
                 observed_contig_prefix=observed_prefix,
                 prefix_matches=prefix_matches,
                 comparison=comparison,
                 provenance_hints=provenance_hints,
-                remote_decode_probe=remote_probe,
                 message=None if comparison["exact_for_cram"] else "Local reference bundle did not validate against the CRAM header.",
             )
 
@@ -596,16 +553,13 @@ def cmd_prepare_context(args: argparse.Namespace) -> int:
             **manifest["runtime"],
             "linux_cache_root": str(linux_cache_root),
             "project_cache_root": str(project_cache_root),
-            "nextflow_home": str(ensure_dir(nextflow_root / "home")),
-            "nextflow_launcher": str(ensure_dir(nextflow_root / "launcher")),
-            "nextflow_work": str(ensure_dir(nextflow_root / "work")),
+            "nextflow_home": str(prepare_dir(nextflow_root / "home")),
             "tool_cache_root": str(tool_cache_root),
         },
         "results": {
             "results_root": str(results_root),
             "run_dir": str(results_run_dir),
             "report_dir": str(report_dir),
-            "manifests_dir": str(manifests_dir),
             "monogenic_dir": str(monogenic_results_dir),
             "prs_dir": str(prs_results_dir),
         },
@@ -622,7 +576,7 @@ def cmd_prepare_context(args: argparse.Namespace) -> int:
             "min_free_gb": min_free_gb,
         },
         "stage_requirements": stage_requirements,
-        "upstream_sample_name": detect_upstream_sample_name(staged_cram),
+        "upstream_sample_name": next(iter({entry["sample"] for entry in rg_entries if entry.get("sample")}), None),
         "contig_prefix": contig_summary["contig_prefix"],
         "contigs": contig_names,
         "shards": {
@@ -642,7 +596,6 @@ def cmd_prepare_context(args: argparse.Namespace) -> int:
             },
             cram_header={"sq_entries": sq_entries, "pg_entries": pg_entries, "rg_entries": rg_entries},
             provenance_hints=provenance_hints,
-            remote_decode_probe=remote_probe,
         ),
         "reference_bundle": reference_stage,
     }
